@@ -46,9 +46,10 @@ GB = 1024 ** 3
 # see KNOWN_ENGINES.
 ALL_ENGINES = ("mariadb", "alisql", "pgvector")
 # These arrived after the first three and were opt-in while they were being
-# brought up: a second MariaDB version is another hour of compiling, and
-# Percona Search is two processes, a replica set and a JVM.
-EXTRA_ENGINES = ("mariadb123", "mongodb", "valkey")
+# brought up: a second MariaDB version is another hour of compiling, Percona
+# Search is two processes, a replica set and a JVM, and VillageSQL is a custom
+# server build.
+EXTRA_ENGINES = ("mariadb123", "mongodb", "valkey", "villagesql")
 # What `run` measures when nobody says otherwise. This defaulted to the
 # original three long after the other three had become part of the study, so
 # `run --profile smoke` proved three engines and `run --profile tuned-complete`
@@ -605,8 +606,13 @@ def generate_report(paths: Dict[str, str], engines: List[str]) -> int:
 # because HNSW insert cost rises as the graph grows and rises again with M
 # (glove-100: ~320 rows/s at M=8, ~70 at M=32). An estimate that is optimistic
 # by 3x is worse than none, so these are the observed mid-grid numbers.
+# VillageSQL builds HNSW incrementally like MariaDB/AliSQL. A Mac M5 60k run
+# measured ~1000 rows/s (RESULTS.md, vector-dev-bench); as with the others the
+# rate falls on larger graphs and higher M, so this is a deliberately
+# conservative mid-grid estimate for the runtime forecast, not the 60k peak.
 _INGEST_ROWS_PER_S = {"mariadb": 150, "mariadb123": 110, "alisql": 55,
-                      "pgvector": 3000, "valkey": 40000, "mongodb": 60000}
+                      "pgvector": 3000, "valkey": 40000, "mongodb": 60000,
+                      "villagesql": 300}
 _DATASET_ROWS = {
     "fashion-mnist-784-euclidean": 60_000,
     "glove-100-angular": 1_183_514,

@@ -1,0 +1,166 @@
+# VillageSQL engine definition.
+#
+# Vector support: the vsql_vector extension (SVECTOR type + HNSW custom index),
+# loaded as a .veb into a VillageSQL server (MySQL 8.4.10 base). Unlike MariaDB
+# MHNSW and AliSQL VIDX -- which ship the vector index in the server itself --
+# VillageSQL's index is a *loadable extension* built against the server's dev
+# (unstable) ABI. The image therefore compiles TWO source trees: the server,
+# then the extension against the server's build tree.
+#
+# Everything vector-specific diverges from the MySQL-family template:
+#   * the column type is SVECTOR(N), not VECTOR(N);
+#   * the index is `CREATE INDEX ... (col <metric>) USING EXTENDED(hnsw)
+#     WITH (M=.., ef_construction=..)`, not an inline `VECTOR INDEX`;
+#   * ef_construction IS tunable (MHNSW/VIDX do not expose it);
+#   * vectors are bound as the text literal '[..]', not raw float32 binary;
+#   * distance is L2_DISTANCE()/COSINE_DISTANCE()/L1_DISTANCE()/INNER_PRODUCT(),
+#     not vec_distance_<metric>().
+name: villagesql
+display_name: VillageSQL
+family: mysql
+
+source:
+  kind: source
+  # Two repos, two branches. prepare-sources.sh git-archives both into one
+  # source.tar (server under source/, extension under extension/). These are
+  # branches, not tags, so `tag` here is a human label used for the image tag
+  # and the manifest -- the actual ref comes from source.server_ref /
+  # source.extension_ref.
+  tag: deb-6-optimizer-scan
+  server_repo: https://github.com/villagesql/villagesql-server.git
+  server_ref: tomas/deb-6-optimizer-scan
+  extension_repo: https://github.com/villagesql/vsql-vector.git
+  extension_ref: tomas/deb-absolute-minimal-bridge
+
+image:
+  runtime: vector-bench/villagesql-runtime
+  bench: vector-bench/villagesql-bench
+  base: ubuntu:24.04
+
+build:
+  # RelWithDebInfo, NOT a debug build. The custom-index gate in
+  # PT_custom_index_type::do_contextualize() is patched to proceed
+  # unconditionally on this branch (the "BENCHMARK PATCH" comment), so the
+  # index routes in an optimized build with no debug flag -- which is the whole
+  # point of measuring it. The extension MUST also be optimized: an empty
+  # CMAKE_BUILD_TYPE would leave the distance kernel at -O0 (~6-10x slow); the
+  # Dockerfile pins it to Release and verifies -O3 in the flags.
+  type: RelWithDebInfo
+  march: x86-64-v3
+  cmake_flags:
+    - -DWITH_SSL=system
+    - -DWITH_BOOST=extra/boost
+    - -DDOWNLOAD_BOOST=1
+    - -DWITH_UNIT_TESTS=OFF
+    - -DWITH_ROUTER=OFF
+    - -DWITH_MYSQLX=OFF
+    - -DWITH_NDB=OFF
+    - -DPLUGIN_NDBCLUSTER=NO
+    # The custom KNN scan requires the hypergraph optimizer (the classic
+    # optimizer crashes on it). Hypergraph is a compile-time option that
+    # defaults ON only for debug builds; in an optimized (RelWithDebInfo) build
+    # it must be enabled explicitly, or `SET optimizer_switch=hypergraph_optimizer=on`
+    # is rejected with "does not yet support use in non-debug builds". This is a
+    # plain option override, so it does NOT force a debug build.
+    - -DWITH_HYPERGRAPH_OPTIMIZER=ON
+  extra_cxxflags: ""
+
+sql:
+  # Preview extensions must be enabled before INSTALL, and the hypergraph
+  # optimizer is mandatory: the classic optimizer crashes on the custom KNN
+  # scan. Both are set GLOBAL/PERSIST by the entrypoint init, but repeated here
+  # so the module also works against a server someone else started.
+  global_setup:
+    - "SET PERSIST vsql_allow_preview_extensions = ON"
+    - "INSTALL EXTENSION vsql_vector"
+  session_setup:
+    - "SET SESSION default_storage_engine = InnoDB"
+    - "SET SESSION optimizer_switch = 'hypergraph_optimizer=on'"
+  # {dim}, {metric}, {m}, {ef_construction}, {engine} substituted by the driver.
+  # The metric name in the index modifier is hnsw_<metric>; the distance fn in
+  # the query is <METRIC>_DISTANCE (see metrics: below).
+  create_table: |
+    CREATE TABLE {table} (
+      id INT PRIMARY KEY,
+      tag INT NOT NULL,
+      v SVECTOR({dim}) NOT NULL,
+      INDEX vi (v {index_metric}) USING EXTENDED(hnsw)
+        WITH (M = {m}, ef_construction = {ef_construction})
+    ) ENGINE={engine}
+  # Vectors are inserted as text literals '[a,b,c]'. vsql_vector parses the text
+  # into float32; there is no raw-binary store path for SVECTOR as there is for
+  # MariaDB/AliSQL VECTOR, so this engine uses the text_bracket binding.
+  insert: "INSERT INTO {table} (id, tag, v) VALUES (%s, %s, %s)"
+  vector_binding: text_bracket
+  query: "SELECT id FROM {table} ORDER BY {distance_fn}(v, %s) LIMIT {k}"
+  query_filtered: "SELECT id FROM {table} WHERE tag < %s ORDER BY {distance_fn}(v, %s) LIMIT {k}"
+  # ef_search is a GLOBAL-only sysvar on this build (session SET → ER 1229).
+  set_ef_search: "SET GLOBAL vsql_vector.ef_search = {ef_search}"
+  explain: "EXPLAIN {query}"
+  # A routed custom KNN scan prints "Custom index distance scan on <ix>" in
+  # EXPLAIN (observed live). Its absence means a brute-force fallback.
+  index_plan_marker: "Custom index distance scan"
+  metrics:
+    # angular -> cosine, euclidean -> l2. Each maps to an index modifier
+    # (hnsw_<x>) and a distance function (<X>_DISTANCE); the driver builds both.
+    angular: cosine
+    euclidean: l2
+
+server:
+  common:
+    - --skip-name-resolve
+    # MySQL 8.4 ships mysql_native_password DISABLED by default. The bench
+    # account is created IDENTIFIED WITH mysql_native_password (so the client
+    # stack matches MariaDB/AliSQL), which fails with "Plugin not loaded" unless
+    # the plugin is turned on here. Same requirement as the HammerDB rig.
+    - --mysql-native-password=ON
+  normalized:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    - --innodb-flush-log-at-trx-commit=2
+    - --innodb-doublewrite=0
+    # Matches MariaDB/AliSQL so the isolation level is identical across the
+    # MySQL-family engines (AliSQL VIDX actually requires READ-COMMITTED; here
+    # it is for cross-engine parity, not a VillageSQL requirement).
+    - --transaction-isolation=READ-COMMITTED
+    # Large enough that a single ~1000-row batch of high-dim text vectors does
+    # not blow past the packet limit (the harness batches, but headroom is cheap).
+    - --max-allowed-packet=1073741824
+  tuned:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    - --innodb-flush-log-at-trx-commit=0
+    - --innodb-doublewrite=0
+    - --innodb-flush-method=O_DIRECT
+    - --transaction-isolation=READ-COMMITTED
+    - --max-allowed-packet=1073741824
+    - --skip-log-bin
+
+storage_engines:
+  normalized: [InnoDB]
+  tuned: [InnoDB]
+
+capabilities:
+  # The one engine that exposes ef_construction as a tunable. In the normalized
+  # pass it is still pinned (fairness), but the report notes VillageSQL and
+  # pgvector are the two engines that can vary it.
+  ef_construction_tunable: true
+  m_per_index: true
+  requires_read_committed: false
+  # This branch of vsql-vector is INSERT + KNN only: no DELETE (churn crashes)
+  # and no filtered/hybrid search (a WHERE alongside the KNN ORDER BY is ignored
+  # by the custom index scan, yielding ~0.1 recall). Run build + concurrency
+  # only in the ops phase until UPDATE/DELETE and filtered search land.
+  filtered_search: false
+  delete_supported: false
+
+# Plan verification is BEST-EFFORT and OBSERVATIONAL for VillageSQL. The custom
+# KNN scan's EXPLAIN signature is not a stable, documented marker string, and the
+# optimizer selects the index on its own — there is NO usable FORCE INDEX hint
+# for the custom index (it is not a normal key the hint syntax accepts). The
+# reference harness in vector-dev-bench proves index usage BEHAVIOURALLY: recall
+# < 1.0 that rises with ef_search, vs an exact-1.0 brute-force scan. The driver
+# captures EXPLAIN and logs it but never forces or hard-fails; the recall signal
+# is the real guard.
+plan_guard:
+  verify_index_used: true
+  hard_fail: false
+  force_index_hint: ""

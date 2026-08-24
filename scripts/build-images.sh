@@ -129,6 +129,7 @@ build_engine() {
     mariadb)  bargs+=(--build-arg "MARIADB_TAG=${tag}") ;;
     alisql)   bargs+=(--build-arg "ALISQL_TAG=${tag}") ;;
     pgvector) bargs+=(--build-arg "PGVECTOR_TAG=${tag}") ;;
+    villagesql) bargs+=(--build-arg "VILLAGESQL_TAG=${tag}") ;;
     # Nothing compiled: the module is copied out of its own published image.
     mongodb)  bargs+=(--build-arg "MONGOT_IMAGE=$(yq_get "$cfg" source.mongot_image "")") ;;
     # Nothing compiled: installed from a Percona repository. The package list
@@ -190,6 +191,7 @@ case "$ENGINE" in
   mongodb)    build_engine mongodb ;;
   # Installed from Percona's valkey repository; nothing is compiled.
   valkey)     build_engine valkey ;;
+  villagesql) build_engine villagesql ;;
   mariadb|alisql|pgvector) build_engine "$ENGINE" ;;
   *) die "unknown engine: $ENGINE" ;;
 esac

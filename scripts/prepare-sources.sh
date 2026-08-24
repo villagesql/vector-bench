@@ -203,6 +203,100 @@ prepare_pgvector() {
 }
 
 # ---------------------------------------------------------------------------
+# VillageSQL — two repos (server + vsql_vector extension) into one source.tar.
+#
+# The extension is built against the server's build tree (dev ABI), so both must
+# ship in the same context. We git-archive each branch into a single tar under
+# source/ (server) and extension/ (vsql_vector). These are branches, not tags,
+# so the pinned commit is resolved from the branch head at prepare time.
+#
+# Unlike MariaDB there are no submodules to init, so a pure `git archive` works.
+# A local checkout (VB_REPO_VILLAGESQL / VB_REPO_VSQL_VECTOR) is used when it has
+# the branch; otherwise we clone the public repo shallow at the branch.
+# ---------------------------------------------------------------------------
+
+# _vsql_repo_at_branch <name> <local_repo> <upstream> <branch> -> echoes repo dir
+# Ensures a repo with <branch> available; prints the dir to archive from and the
+# resolved sha via the globals _VSQL_DIR / _VSQL_SHA / _VSQL_ORIGIN.
+_vsql_ensure_branch() {
+  local name="$1" local_repo="$2" upstream="$3" branch="$4"
+  if [[ -d "$local_repo/.git" ]] \
+     && git -C "$local_repo" rev-parse -q --verify "refs/remotes/origin/$branch^{commit}" >/dev/null 2>&1; then
+    _VSQL_DIR="$local_repo"; _VSQL_ORIGIN="local:$local_repo"
+    _VSQL_SHA="$(git -C "$local_repo" rev-parse "refs/remotes/origin/$branch^{commit}")"
+    _VSQL_REF="refs/remotes/origin/$branch"
+    return
+  fi
+  if [[ -d "$local_repo/.git" ]] \
+     && git -C "$local_repo" rev-parse -q --verify "$branch^{commit}" >/dev/null 2>&1; then
+    _VSQL_DIR="$local_repo"; _VSQL_ORIGIN="local:$local_repo"
+    _VSQL_SHA="$(git -C "$local_repo" rev-parse "$branch^{commit}")"
+    _VSQL_REF="$branch"
+    return
+  fi
+  local clone="$VB_SOURCES/${name}-git"
+  warn "$name: branch $branch not in local checkout; cloning $upstream (shallow)"
+  if [[ ! -d "$clone/.git" ]]; then
+    git clone --quiet --depth 1 --branch "$branch" --single-branch "$upstream" "$clone"
+  else
+    git -C "$clone" fetch --quiet --depth 1 origin "$branch"
+    git -C "$clone" checkout --quiet -B "$branch" FETCH_HEAD
+  fi
+  _VSQL_DIR="$clone"; _VSQL_ORIGIN="$upstream"
+  _VSQL_SHA="$(git -C "$clone" rev-parse HEAD)"
+  _VSQL_REF="HEAD"
+}
+
+prepare_villagesql() {
+  local cfg="$VB_CONFIG/engines/villagesql.yml"
+  local tag; tag="$(yq_get "$cfg" source.tag deb-6-optimizer-scan)"
+  local srv_repo; srv_repo="$(yq_get "$cfg" source.server_repo https://github.com/villagesql/villagesql-server.git)"
+  local srv_ref;  srv_ref="$(yq_get "$cfg" source.server_ref tomas/deb-6-optimizer-scan)"
+  local ext_repo; ext_repo="$(yq_get "$cfg" source.extension_repo https://github.com/villagesql/vsql-vector.git)"
+  local ext_ref;  ext_ref="$(yq_get "$cfg" source.extension_ref tomas/deb-absolute-minimal-bridge)"
+  local tar="$VB_SOURCES/villagesql-${tag}.tar"
+
+  _vsql_ensure_branch villagesql-server "$VB_REPO_VILLAGESQL" "$srv_repo" "$srv_ref"
+  local srv_dir="$_VSQL_DIR" srv_sha="$_VSQL_SHA" srv_origin="$_VSQL_ORIGIN" srv_gitref="$_VSQL_REF"
+  _vsql_ensure_branch vsql-vector "$VB_REPO_VSQL_VECTOR" "$ext_repo" "$ext_ref"
+  local ext_dir="$_VSQL_DIR" ext_sha="$_VSQL_SHA" ext_origin="$_VSQL_ORIGIN" ext_gitref="$_VSQL_REF"
+
+  # Fingerprint = both commits; reuse the tarball only when neither moved.
+  local combined_sha; combined_sha="$(vb_hash "$srv_sha $ext_sha")"
+  if tarball_current villagesql "$combined_sha" "$tar"; then
+    ok "villagesql: source tarball up to date ($(human_bytes "$(stat -c%s "$tar")"))"
+    stage_context villagesql "$tar"; return
+  fi
+
+  info "villagesql: exporting server $srv_ref (${srv_sha:0:12}) from $srv_dir"
+  git -C "$srv_dir" archive --format=tar --prefix=source/ "$srv_gitref" > "$tar.tmp"
+  info "villagesql: appending extension $ext_ref (${ext_sha:0:12}) from $ext_dir"
+  # git archive can only write a whole tar; build the extension tar separately
+  # and concatenate (both are ustar streams; tar handles the concatenation when
+  # we use --concatenate on the first).
+  local ext_tar="$tar.ext.tmp"
+  git -C "$ext_dir" archive --format=tar --prefix=extension/ "$ext_gitref" > "$ext_tar"
+  tar --concatenate --file "$tar.tmp" "$ext_tar"
+  rm -f "$ext_tar"
+  mv "$tar.tmp" "$tar"
+
+  # Record both commits. record_meta stores one commit; VillageSQL needs two, so
+  # write a richer meta file directly (the reuse check reads .commit).
+  python3 - "$VB_SOURCES/villagesql.source.json" "$tag" "$combined_sha" \
+            "$srv_sha" "$srv_origin" "$ext_sha" "$ext_origin" <<'PY'
+import json, sys
+out, tag, combined, srv_sha, srv_origin, ext_sha, ext_origin = sys.argv[1:8]
+json.dump({"engine": "villagesql", "tag": tag, "commit": combined,
+           "server_commit": srv_sha, "server_origin": srv_origin,
+           "extension_commit": ext_sha, "extension_origin": ext_origin},
+          open(out, "w"), indent=2, sort_keys=True)
+open(out, "a").write("\n")
+PY
+  ok "villagesql: server=${srv_sha:0:12} extension=${ext_sha:0:12} tag=$tag"
+  stage_context villagesql "$tar"
+}
+
+# ---------------------------------------------------------------------------
 # Build context staging
 # ---------------------------------------------------------------------------
 
@@ -306,9 +400,10 @@ case "$ENGINE" in
   mariadb123) prepare_mariadb mariadb123 ;;
   alisql)     prepare_alisql ;;
   pgvector)   prepare_pgvector ;;
+  villagesql) prepare_villagesql ;;
   mongodb)    prepare_mongodb ;;
   valkey)     prepare_valkey ;;
-  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|valkey|all)" ;;
+  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|villagesql|mongodb|valkey|all)" ;;
 esac
 
 ok "sources prepared"

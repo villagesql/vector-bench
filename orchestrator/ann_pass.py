@@ -25,6 +25,7 @@ from .config import ResolvedResources, server_args
 # Constructor class names, as ann-benchmarks expects them in config.yml.
 CONSTRUCTORS = {"mariadb": "MariaDB", "mariadb123": "MariaDB123",
                 "alisql": "AliSQL", "pgvector": "PGVector",
+                "villagesql": "VillageSQL",
                 "mongodb": "PerconaSearch", "valkey": "ValkeySearch"}
 
 # Where each engine's data directory lives inside its image. The ops path
@@ -33,6 +34,7 @@ DATA_MOUNT = {
     "mariadb": "/var/lib/vbench",
     "mariadb123": "/var/lib/vbench",
     "alisql": "/var/lib/vbench",
+    "villagesql": "/var/lib/vbench",
     "pgvector": "/var/lib/postgresql",
     # Both processes write under one root: mongod's dbpath and mongot's Lucene
     # segments. Sizing the index means reading mongot's directory, because
@@ -178,6 +180,29 @@ def render_config(engine: str, profile: Dict[str, Any],
                 "args": {},
                 "query_args": query_args,
             }
+    elif engine == "villagesql":
+        # VillageSQL exposes ef_construction like pgvector, so it follows the
+        # same rule: pinned in the normalized pass (MariaDB/AliSQL lack the knob,
+        # so sweeping it there would be an unfair extra axis), swept in the tuned
+        # pass. It is InnoDB-only and builds incrementally, so there is no
+        # storage-engine or build-mode axis — only M x ef_construction. The
+        # arg_groups keys (M, ef_construction, engine) match what the villagesql
+        # module reads from method_param.
+        if resource_pass == "tuned" and extras.get("villagesql_ef_construction"):
+            ef_constructions = list(extras["villagesql_ef_construction"])
+        else:
+            ef_constructions = [int(ann.get("villagesql_ef_construction", 200))]
+
+        run_groups["innodb"] = {
+            "arg_groups": [{
+                "M": m_values,
+                "ef_construction": ef_constructions,
+                "engine": "InnoDB",
+            }],
+            "args": {},
+            "query_args": query_args,
+        }
+
     elif engine == "valkey":
         # The same two knobs pgvector has, so the same rule: pinned in the
         # normalized pass because MariaDB and AliSQL still lack ef_construction,

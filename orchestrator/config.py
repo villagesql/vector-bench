@@ -212,6 +212,21 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         buffer_fraction = buffer_fraction + graph_fraction
         graph_fraction = 0.0
 
+    if engine == "villagesql":
+        # Same reasoning as pgvector, for the same reason. VillageSQL's vsql_vector
+        # HNSW graph is InnoDB-resident: it lives in the InnoDB buffer pool, with
+        # no separate vector graph cache like MariaDB's mhnsw_max_cache_size or
+        # AliSQL's vidx_hnsw_cache_size. Leaving graph_fraction carved out would
+        # hand VillageSQL strictly less resident memory than the MySQL-family
+        # engines for the same container limit (it would get only the buffer
+        # fraction, while MariaDB/AliSQL get buffer + a separate graph cache), so
+        # fold the graph share into the buffer pool. Critical for the RAM-cap /
+        # out-of-core study, where an under-sized buffer pool would make
+        # VillageSQL page to disk sooner than its peers for reasons of accounting,
+        # not implementation.
+        buffer_fraction = buffer_fraction + graph_fraction
+        graph_fraction = 0.0
+
     # Taken here, before any engine-specific adjustment below. Every engine
     # under one pass sees the same declared knobs; what each does with them
     # differs by design, so hashing the resolved split fragments the results
