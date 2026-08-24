@@ -24,6 +24,9 @@ export VB_BUILDCTX="${VB_WORK}/buildctx"
 export VB_REPO_MARIADB="${VB_REPO_MARIADB:-$(cd "${VB_ROOT}/.." && pwd)/server}"
 export VB_REPO_ALISQL="${VB_REPO_ALISQL:-$(cd "${VB_ROOT}/.." && pwd)/AliSQL}"
 export VB_REPO_ANNB="${VB_REPO_ANNB:-$(cd "${VB_ROOT}/.." && pwd)/ann-benchmarks}"
+# VillageSQL builds from two repos: the server and the vsql_vector extension.
+export VB_REPO_VILLAGESQL="${VB_REPO_VILLAGESQL:-$(cd "${VB_ROOT}/.." && pwd)/villagesql-server}"
+export VB_REPO_VSQL_VECTOR="${VB_REPO_VSQL_VECTOR:-$(cd "${VB_ROOT}/.." && pwd)/vsql-vector}"
 
 # ---------------------------------------------------------------------------
 # Logging

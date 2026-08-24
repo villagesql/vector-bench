@@ -60,6 +60,24 @@ def to_binary_f32(vector) -> bytes:
     return numpy.asarray(vector, dtype="<f4").tobytes()
 
 
+def to_text_bracket(vector) -> str:
+    """Encode a vector as a '[a,b,c]' text literal.
+
+    VillageSQL's SVECTOR has no raw-binary store path: it parses vectors from a
+    text literal (implicit string -> SVECTOR conversion). This is the client-side
+    counterpart of MariaDB/AliSQL's binary_f32 binding; a dialect selects one via
+    Dialect.encode_vector.
+    """
+    return "[" + ",".join(repr(float(x)) for x in numpy.asarray(vector, dtype="<f4")) + "]"
+
+
+# Value encoders addressable by name from an engine config's `vector_binding`.
+VECTOR_ENCODERS = {
+    "binary_f32": to_binary_f32,
+    "text_bracket": to_text_bracket,
+}
+
+
 
 # Queries run before each configuration is timed. The first measured point
 # otherwise pays for a cold graph cache and lands slower than the next one,
@@ -102,9 +120,20 @@ class Dialect:
 
 
 class VBMySQLBase(BaseANN):
-    """Base ann-benchmarks algorithm for MariaDB and AliSQL."""
+    """Base ann-benchmarks algorithm for MariaDB and AliSQL.
+
+    VillageSQL subclasses this too (see algorithms/villagesql) and overrides the
+    vector-encoding and DDL/query hooks, which is why those go through
+    `encode_vector()` / `_query_sql()` / `create_table()` rather than calling
+    module-level `to_binary_f32` directly.
+    """
 
     dialect: Dialect  # set by subclasses
+
+    # Value encoder: maps a Python vector to the bound parameter value. MariaDB
+    # and AliSQL bind raw float32; VillageSQL binds a '[..]' text literal.
+    def encode_vector(self, vector):
+        return to_binary_f32(vector)
 
     # ------------------------------------------------------------------
     # Construction / server lifecycle
@@ -315,7 +344,7 @@ class VBMySQLBase(BaseANN):
 
         for i, embedding in enumerate(X):
             idx = offset + i
-            rows.append((idx, idx % 100, to_binary_f32(embedding)))
+            rows.append((idx, idx % 100, self.encode_vector(embedding)))
             if len(rows) >= INSERT_BATCH:
                 cur.executemany(sql, rows)
                 cur.execute("COMMIT")

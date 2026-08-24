@@ -278,7 +278,7 @@ def _driver_table() -> Dict[str, Any]:
     on `argument --engine: invalid choice`.
     """
     from .mongo import MongoDriver
-    from .mysql_family import AliSQLDriver, MariaDBDriver
+    from .mysql_family import AliSQLDriver, MariaDBDriver, VillageSQLDriver
     from .valkey import ValkeyDriver
 
     return {
@@ -286,6 +286,7 @@ def _driver_table() -> Dict[str, Any]:
         # Same server software at a different tag; the driver is identical.
         "mariadb123": MariaDBDriver,
         "alisql": AliSQLDriver,
+        "villagesql": VillageSQLDriver,
         "pgvector": PostgresDriver,
         "mongodb": MongoDriver,
         "valkey": ValkeyDriver,

@@ -24,7 +24,8 @@ from .config import ResolvedResources, server_args
 from .manifest import utcnow
 
 DEFAULT_PORTS = {"mariadb": 3306, "mariadb123": 3306,
-                 "alisql": 3306, "pgvector": 5432, "mongodb": 27017,
+                 "alisql": 3306, "villagesql": 3306,
+                 "pgvector": 5432, "mongodb": 27017,
                  "valkey": 6379}
 
 # How much of the server's own log to keep beside the measurements. Generous,
@@ -71,6 +72,11 @@ PROBES = {
         "/opt/alisql/bin/mysql -ubench -pbench "
         "--socket=/var/run/vbench/alisql.sock -e 'SELECT 1' >/dev/null 2>&1",
     ],
+    "villagesql": [
+        "sh", "-c",
+        "/opt/villagesql/bin/mysql -ubench -pbench "
+        "--socket=/var/run/vbench/villagesql.sock -e 'SELECT 1' >/dev/null 2>&1",
+    ],
     # pg_isready alone is not enough: it reports "accepting connections" while
     # the official entrypoint is still in its bootstrap phase and before
     # POSTGRES_DB has been created, so a probe based on it passes seconds too
@@ -86,6 +92,7 @@ DB_CREDENTIALS = {
     "mariadb": ("bench", "bench"),
     "mariadb123": ("bench", "bench"),
     "alisql": ("bench", "bench"),
+    "villagesql": ("bench", "bench"),
     "pgvector": ("postgres", ""),
     # The only engine here that must run with auth on. mongot refuses to parse
     # a config without SCRAM or x509, so mongod runs authenticated and every
@@ -103,6 +110,10 @@ SERVER_DATA_MOUNT = {
     "mariadb": "/server-data/data",
     "mariadb123": "/server-data/data",
     "alisql": "/server-data/data",
+    # SVECTOR storage is InnoDB-resident in the table's tablespace; the driver
+    # sizes it from the catalog (information_schema), so no shared mount is
+    # strictly needed, but keep the layout uniform with the other MySQL engines.
+    "villagesql": "/server-data/data",
     "pgvector": None,
     # mongot's Lucene segments are files belonging to another process, so the
     # client has to read them directly to size the index at all.
@@ -374,15 +385,53 @@ def _quantization(profile: Dict[str, Any], resources: Dict[str, Any],
     return str((profile.get("ann", {}) or {}).get("mongodb_quantization", "none"))
 
 
+def _supported_workloads(requested: List[str], engine: str,
+                         engine_cfg: Dict[str, Any]) -> List[str]:
+    """Drop workloads the engine declares it does not support.
+
+    The engine yaml declares capability flags (delete_supported,
+    filtered_search); an engine that lacks a capability would otherwise crash
+    or produce meaningless numbers on the corresponding workload. These flags
+    default to True, so engines that don't set them are unaffected.
+
+      churn    needs DELETE  -> requires delete_supported
+      filtered needs WHERE + KNN -> requires filtered_search
+
+    Skips are logged (never silent) so a short run list is explained, not
+    mistaken for full coverage.
+    """
+    caps = {
+        "churn": ("delete_supported",
+                  "DELETE not supported (would crash the server)"),
+        "filtered": ("filtered_search",
+                     "filtered search not supported (WHERE ignored -> ~0 recall)"),
+    }
+    kept: List[str] = []
+    for w in requested:
+        flag_reason = caps.get(w)
+        if flag_reason is not None:
+            flag, reason = flag_reason
+            if not engine_cfg.get(flag, True):
+                print(f"[ops] {engine}: skipping '{w}' workload -- {reason} "
+                      f"(engine config {flag}=false)")
+                continue
+        kept.append(w)
+    return kept
+
+
 def harness_args(profile: Dict[str, Any], m: int, engine: str,
                  resolved: ResolvedResources,
                  resource_pass: str, resources: Dict[str, Any],
+                 engine_cfg: Optional[Dict[str, Any]] = None,
                  build_mode: str = "post",
                  storage_engine: str = "InnoDB",
                  iterative_scan: Optional[str] = None) -> List[str]:
     """Translate a profile into ops-harness command-line arguments."""
     ops = profile.get("ops", {}) or {}
     ann = profile.get("ann", {}) or {}
+
+    workloads = _supported_workloads(
+        list(ops.get("workloads", ["build"])), engine, engine_cfg or {})
 
     args = [
         "--m", str(m),
@@ -398,7 +447,7 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
           if engine == "mongodb" else []),
         "--load-threads", str(ops.get("load_threads", 1)),
         "--max-queries", str(ops.get("max_queries", 1000)),
-        "--workloads", ",".join(ops.get("workloads", ["build"])),
+        "--workloads", ",".join(workloads),
         "--client-counts", ",".join(str(c) for c in ops.get("client_counts", [1])),
         "--concurrency-duration", str(ops.get("concurrency_duration_s", 20)),
         "--concurrency-repeats", str(ops.get("concurrency_repeats", 1)),
@@ -407,9 +456,24 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
     ]
     if ops.get("subset_rows"):
         args += ["--subset-rows", str(ops["subset_rows"])]
-    if engine == "pgvector":
-        ef_construction = ann.get("pgvector_ef_construction", 200)
-        args += ["--ef-construction", str(ef_construction)]
-        if iterative_scan:
-            args += ["--iterative-scan", iterative_scan]
+
+    # ef_construction is set for EVERY engine that exposes it, from a single
+    # engine-neutral knob, so two engines in one run always build to the same
+    # graph quality. Precedence: ops.ef_construction (generic) -> the historical
+    # pgvector-specific key (kept for back-compat) -> 200. Engines that ignore
+    # ef_construction (MHNSW/VIDX) simply do not read the flag; passing it is
+    # harmless and keeps the value visible in the recorded args for every run.
+    #
+    # Previously this flag was passed ONLY for pgvector, so VillageSQL (which
+    # DOES honour ef_construction) silently fell back to its driver default —
+    # correct only by coincidence when both happened to be 200. Setting it
+    # explicitly for all engines makes the comparison fair by construction.
+    ef_construction = (
+        ops.get("ef_construction")
+        or ann.get("pgvector_ef_construction")
+        or 200
+    )
+    args += ["--ef-construction", str(ef_construction)]
+    if engine == "pgvector" and iterative_scan:
+        args += ["--iterative-scan", iterative_scan]
     return args

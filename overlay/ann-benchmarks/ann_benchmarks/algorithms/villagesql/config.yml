@@ -1,0 +1,21 @@
+# Default (full-profile) VillageSQL sweep.
+#
+# scripts/render-configs.py overwrites this file in the working copy according to
+# the selected profile.
+#
+# VillageSQL's vsql_vector HNSW index is InnoDB-resident and, unlike MariaDB
+# MHNSW and AliSQL VIDX, exposes ef_construction as a real build knob (efc < M
+# is rejected). Both M and ef_construction therefore vary in the arg groups.
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: VillageSQL
+    disabled: false
+    docker_tag: vector-bench/villagesql-bench
+    module: ann_benchmarks.algorithms.villagesql
+    name: villagesql
+    run_groups:
+      innodb:
+        arg_groups: [{M: [6, 8, 16, 24, 32], ef_construction: [200], engine: 'InnoDB'}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]

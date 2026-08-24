@@ -404,3 +404,170 @@ class MariaDBDriver(MySQLFamilyDriver):
 class AliSQLDriver(MySQLFamilyDriver):
     dialect = ALISQL_DIALECT
     name = "alisql"
+
+
+# ---------------------------------------------------------------------------
+# VillageSQL (vsql_vector: SVECTOR type + HNSW custom index)
+# ---------------------------------------------------------------------------
+#
+# VillageSQL is MySQL-family (MariaDB Connector/C, port 3306, bench account), so
+# it reuses the load/concurrency/churn machinery above. It differs from MHNSW and
+# VIDX in the same ways the ann module documents:
+#   * column type SVECTOR(N), and the index is a SEPARATE custom index
+#     (CREATE INDEX ... USING EXTENDED(hnsw) WITH (...)), not an inline
+#     VECTOR INDEX in CREATE TABLE;
+#   * vectors bind as a '[..]' text literal, and the QUERY vector must be INLINED
+#     into the SQL (not a bound %s) or the optimizer will not route to the
+#     custom index;
+#   * ef_search is a GLOBAL-only sysvar (SET GLOBAL vsql_vector.ef_search);
+#   * a routed scan shows "Custom index distance scan" in EXPLAIN.
+
+VILLAGESQL_DIALECT = MySQLDialect(
+    name="villagesql",
+    session_setup=(
+        "SET SESSION default_storage_engine = InnoDB",
+        "SET SESSION optimizer_switch = 'hypergraph_optimizer=on'",
+    ),
+    # preview + INSTALL are done by the image entrypoint at startup; nothing to
+    # do per-connection. (Re-installing would error "already installed".)
+    global_setup=(),
+    set_ef_search="SET GLOBAL vsql_vector.ef_search = {ef_search}",
+    index_name="Custom index distance scan",  # EXPLAIN marker (see below)
+    # SVECTOR storage is InnoDB-resident under the table's own tablespace; there
+    # is no separate index file to glob. Index size falls back to the catalog /
+    # is reported as part of table_bytes.
+    index_file_globs=(),
+    metric_names={"angular": "cosine", "euclidean": "l2"},
+)
+
+# metric key -> (index modifier, distance function, order direction)
+_VSQL_METRICS = {
+    "l2": ("hnsw_l2", "L2_DISTANCE", "ASC"),
+    "cosine": ("hnsw_cosine", "COSINE_DISTANCE", "ASC"),
+    "l1": ("hnsw_l1", "L1_DISTANCE", "ASC"),
+    "ip": ("hnsw_inner_product", "INNER_PRODUCT", "DESC"),
+}
+
+
+def _to_text_bracket(vector) -> str:
+    return "[" + ",".join(repr(float(x)) for x in numpy.asarray(vector, dtype="<f4")) + "]"
+
+
+class VillageSQLDriver(MySQLFamilyDriver):
+    dialect = VILLAGESQL_DIALECT
+    name = "villagesql"
+    # The graph is built incrementally on INSERT (like MHNSW/VIDX), so the index
+    # is created up front and there is no separate bulk-build step.
+    incremental_index = True
+
+    def _vsql_metric(self):
+        metric = self.dialect.metric_names[self._index.metric]  # 'l2'/'cosine'
+        return _VSQL_METRICS[metric]
+
+    def create_schema(self, index: IndexSpec) -> None:
+        self._index = index
+        mod, _fn, _order = _VSQL_METRICS[self.dialect.metric_names[index.metric]]
+        self._cur.execute(
+            f"CREATE TABLE {TABLE} (\n"
+            f"  id INT PRIMARY KEY,\n"
+            f"  tag INT NOT NULL,\n"
+            f"  v SVECTOR({index.dim}) NOT NULL,\n"
+            f"  KEY tag_idx (tag)\n"
+            f") ENGINE={index.storage_engine}"
+        )
+        ef_c = getattr(index, "ef_construction", None) or 200
+        ddl = (
+            f"CREATE INDEX vi ON {TABLE} (v {mod}) USING EXTENDED(hnsw) "
+            f"WITH (M = {index.m}, ef_construction = {ef_c})"
+        )
+        print(f"[{self.name}] {ddl}")
+        self._cur.execute(ddl)
+
+    def create_index(self, index: IndexSpec) -> None:
+        # Index created in create_schema; incremental build on INSERT.
+        self._index = index
+
+    # --- inserts bind text, not binary ---------------------------------------
+
+    def _load_range(self, cur, vectors, tags, start_id, lo, hi, batch=1000, report=False):
+        # Same batched loader as the base, but binding the vector as a text
+        # literal and a larger default batch (text vectors are bigger, but 1000 x
+        # 784-dim stays well under the 1 GB max_allowed_packet the server sets).
+        sql = f"INSERT INTO {TABLE} (id, tag, v) VALUES (%s, %s, %s)"
+        rows: List[Tuple[int, int, str]] = []
+        total = hi - lo
+        started = time.perf_counter()
+        next_report = started + PROGRESS_INTERVAL_S
+        for i in range(lo, hi):
+            rows.append((start_id + i, int(tags[i]), _to_text_bracket(vectors[i])))
+            if len(rows) >= batch:
+                cur.executemany(sql, rows)
+                rows = []
+                now = time.perf_counter()
+                if report and now >= next_report:
+                    done = i - lo + 1
+                    rate = done / max(now - started, 1e-9)
+                    eta = (total - done) / max(rate, 1e-9)
+                    print(f"[{self.name}]   {done:,}/{total:,} rows, "
+                          f"{rate:,.0f} rows/s, ETA {eta / 60:.1f} min", flush=True)
+                    next_report = now + PROGRESS_INTERVAL_S
+        if rows:
+            cur.executemany(sql, rows)
+        cur.execute("COMMIT")
+
+    def insert_rows(self, ids, vectors, tags) -> None:
+        sql = f"INSERT INTO {TABLE} (id, tag, v) VALUES (%s, %s, %s)"
+        rows = [(int(i), int(t), _to_text_bracket(v)) for i, v, t in zip(ids, vectors, tags)]
+        for c in range(0, len(rows), 1000):
+            self._cur.executemany(sql, rows[c:c + 1000])
+        self._cur.execute("COMMIT")
+
+    # --- queries inline the vector literal (routing depends on the SQL shape) --
+
+    def _vsql_select(self, k: int, vector, filtered: bool, tag_threshold=None) -> str:
+        _mod, fn, order = self._vsql_metric()
+        lit = "'" + _to_text_bracket(vector) + "'"
+        where = f"WHERE tag < {int(tag_threshold)} " if filtered else ""
+        return (
+            f"SELECT id FROM {TABLE} {where}"
+            f"ORDER BY {fn}(v, {lit}) {order} LIMIT {int(k)}"
+        )
+
+    def query(self, vector, k: int) -> List[int]:
+        self._cur.execute(self._vsql_select(k, vector, False))
+        return [row[0] for row in self._cur.fetchall()]
+
+    def query_filtered(self, vector, k: int, tag_threshold: int) -> List[int]:
+        self._cur.execute(self._vsql_select(k, vector, True, tag_threshold))
+        return [row[0] for row in self._cur.fetchall()]
+
+    def explain_uses_vector_index(self, vector, k, tag_threshold=None) -> bool:
+        filtered = tag_threshold is not None
+        try:
+            self._cur.execute("EXPLAIN " + self._vsql_select(k, vector, filtered, tag_threshold))
+            plan = " | ".join(str(c) for row in self._cur.fetchall() for c in row)
+        except Exception as exc:
+            print(f"[{self.name}] EXPLAIN failed: {exc}")
+            return False
+        used = self.dialect.index_name in plan  # "Custom index distance scan"
+        if not used:
+            print(f"[{self.name}] WARNING: custom vector index NOT used "
+                  f"(k={k}, filtered={filtered}). Plan: {plan}")
+        return used
+
+    def index_bytes(self) -> int:
+        # No separate index file; report the table's total on-disk size via the
+        # catalog (the InnoDB-resident SVECTOR storage is inside the tablespace).
+        try:
+            self._cur.execute(
+                "SELECT DATA_LENGTH + INDEX_LENGTH FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+                (DATABASE, TABLE),
+            )
+            row = self._cur.fetchone()
+            return int(row[0]) if row and row[0] else 0
+        except Exception:
+            return 0
+
+    def capabilities(self) -> Dict[str, Any]:
+        return {"incremental_index": True, "ef_construction_tunable": True}
