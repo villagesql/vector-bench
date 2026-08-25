@@ -23,10 +23,17 @@ SET PERSIST optimizer_switch = 'hypergraph_optimizer=on';
 
 -- Install the SVECTOR + HNSW extension, discovered by name from lib/veb. Only
 -- ONE extension that registers the SVECTOR type may be installed: two make type
--- resolution ambiguous and the server asserts. INSTALL EXTENSION is transactional
--- against the extension catalog and persists across restarts, so a second boot
--- would fail "already installed" — tolerate that rather than let it abort init.
--- (--init-file aborts startup on error, so guard with a handler.)
+-- resolution ambiguous and the server asserts.
+--
+-- This file runs via --init-file, which the SERVER reads one statement at a
+-- time and ABORTS startup on any error. INSTALL EXTENSION persists across
+-- restarts, so on a persisted datadir a second run would error "already
+-- installed" and wedge the server. It also cannot be wrapped in a prepared
+-- statement (ER 1295, "not supported in the prepared statement protocol") or a
+-- DELIMITER-based procedure (--init-file doesn't parse client DELIMITER). So
+-- idempotency is handled OUTSIDE the SQL: the entrypoint passes --init-file
+-- ONLY on the first boot (fresh datadir), never on a restart. A plain
+-- INSTALL EXTENSION is therefore correct and safe here.
 INSTALL EXTENSION vsql_vector;
 
 FLUSH PRIVILEGES;

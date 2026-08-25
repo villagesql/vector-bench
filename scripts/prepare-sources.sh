@@ -215,33 +215,34 @@ prepare_pgvector() {
 # the branch; otherwise we clone the public repo shallow at the branch.
 # ---------------------------------------------------------------------------
 
-# _vsql_repo_at_branch <name> <local_repo> <upstream> <branch> -> echoes repo dir
-# Ensures a repo with <branch> available; prints the dir to archive from and the
-# resolved sha via the globals _VSQL_DIR / _VSQL_SHA / _VSQL_ORIGIN.
+# _vsql_ensure_branch <name> <upstream> <branch>
+# GitHub-first: always fetch <branch> fresh from <upstream> and build from the
+# pushed HEAD. This guarantees "what got built == what is on GitHub" — never a
+# stale local checkout. To iterate, commit+push the branch, then rebuild.
+# Sets the globals _VSQL_DIR / _VSQL_SHA / _VSQL_ORIGIN / _VSQL_REF.
+#
+# A shallow (--depth 1) clone dir under $VB_SOURCES is reused across runs to
+# avoid re-downloading history; each run re-fetches the branch and hard-resets
+# to its remote tip, so a normal push OR a force-push is picked up correctly.
 _vsql_ensure_branch() {
-  local name="$1" local_repo="$2" upstream="$3" branch="$4"
-  if [[ -d "$local_repo/.git" ]] \
-     && git -C "$local_repo" rev-parse -q --verify "refs/remotes/origin/$branch^{commit}" >/dev/null 2>&1; then
-    _VSQL_DIR="$local_repo"; _VSQL_ORIGIN="local:$local_repo"
-    _VSQL_SHA="$(git -C "$local_repo" rev-parse "refs/remotes/origin/$branch^{commit}")"
-    _VSQL_REF="refs/remotes/origin/$branch"
-    return
-  fi
-  if [[ -d "$local_repo/.git" ]] \
-     && git -C "$local_repo" rev-parse -q --verify "$branch^{commit}" >/dev/null 2>&1; then
-    _VSQL_DIR="$local_repo"; _VSQL_ORIGIN="local:$local_repo"
-    _VSQL_SHA="$(git -C "$local_repo" rev-parse "$branch^{commit}")"
-    _VSQL_REF="$branch"
-    return
-  fi
+  local name="$1" upstream="$2" branch="$3"
   local clone="$VB_SOURCES/${name}-git"
-  warn "$name: branch $branch not in local checkout; cloning $upstream (shallow)"
+
   if [[ ! -d "$clone/.git" ]]; then
+    info "$name: cloning $upstream @ $branch (shallow)"
+    rm -rf "$clone"
     git clone --quiet --depth 1 --branch "$branch" --single-branch "$upstream" "$clone"
   else
-    git -C "$clone" fetch --quiet --depth 1 origin "$branch"
-    git -C "$clone" checkout --quiet -B "$branch" FETCH_HEAD
+    # Re-fetch the branch tip. --depth 1 keeps it shallow; FETCH_HEAD is the
+    # remote tip regardless of any local state, so force-pushes reset cleanly.
+    info "$name: fetching $upstream @ $branch (shallow, pushed HEAD)"
+    git -C "$clone" fetch --quiet --depth 1 origin "$branch" \
+      || { warn "$name: fetch failed; re-cloning"; rm -rf "$clone"; \
+           git clone --quiet --depth 1 --branch "$branch" --single-branch "$upstream" "$clone"; }
+    git -C "$clone" checkout --quiet -B "$branch" FETCH_HEAD 2>/dev/null \
+      || git -C "$clone" reset --quiet --hard FETCH_HEAD
   fi
+
   _VSQL_DIR="$clone"; _VSQL_ORIGIN="$upstream"
   _VSQL_SHA="$(git -C "$clone" rev-parse HEAD)"
   _VSQL_REF="HEAD"
@@ -256,9 +257,9 @@ prepare_villagesql() {
   local ext_ref;  ext_ref="$(yq_get "$cfg" source.extension_ref tomas/deb-absolute-minimal-bridge)"
   local tar="$VB_SOURCES/villagesql-${tag}.tar"
 
-  _vsql_ensure_branch villagesql-server "$VB_REPO_VILLAGESQL" "$srv_repo" "$srv_ref"
+  _vsql_ensure_branch villagesql-server "$srv_repo" "$srv_ref"
   local srv_dir="$_VSQL_DIR" srv_sha="$_VSQL_SHA" srv_origin="$_VSQL_ORIGIN" srv_gitref="$_VSQL_REF"
-  _vsql_ensure_branch vsql-vector "$VB_REPO_VSQL_VECTOR" "$ext_repo" "$ext_ref"
+  _vsql_ensure_branch vsql-vector "$ext_repo" "$ext_ref"
   local ext_dir="$_VSQL_DIR" ext_sha="$_VSQL_SHA" ext_origin="$_VSQL_ORIGIN" ext_gitref="$_VSQL_REF"
 
   # Fingerprint = both commits; reuse the tarball only when neither moved.

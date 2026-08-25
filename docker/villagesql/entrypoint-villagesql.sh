@@ -48,11 +48,19 @@ ensure_dirs() {
   mkdir -p "$DATA_DIR" "$(dirname "$SOCKET")" "$(dirname "$LOG_FILE")"
 }
 
+# Set to 1 by initialise() when it actually creates a fresh datadir; left 0 when
+# the datadir already existed. start_server() uses this to run --init-file ONLY
+# on first boot — INSTALL EXTENSION in init.sql is not idempotent and would abort
+# a restart (see init.sql), and it cannot be guarded in SQL (ER 1295 / no
+# DELIMITER under --init-file), so freshness is decided here instead.
+FRESH_INIT=0
+
 initialise() {
   if [[ -d "$DATA_DIR/mysql" ]]; then
     log "data directory already initialised at $DATA_DIR"
     return 0
   fi
+  FRESH_INIT=1
   log "initialising data directory at $DATA_DIR"
   "$MYSQLD" \
     --no-defaults \
@@ -82,6 +90,15 @@ start_server() {
     # enabled here. The harness also passes this via VB_SERVER_ARGS, but hard-code
     # it too so a by-hand `docker run ... server` starts a usable server as well.
     --mysql-native-password=ON
+    # The preview gate must be ON *before* the server auto-loads the persisted
+    # vsql_vector extension. init.sql SET-PERSISTs it, but on a RESTART the
+    # persisted extension is auto-loaded from the catalog and the parse-early
+    # var from mysqld-auto.cnf is not reliably applied first (and --no-defaults
+    # complicates option-file handling) — so a restart aborted with "requires
+    # preview capabilities but vsql_allow_preview_extensions is OFF". Passing it
+    # as an explicit startup arg guarantees it is set before extension load on
+    # EVERY boot, fresh or restart, independent of PERSIST timing.
+    --vsql_allow_preview_extensions=ON
     # The extension loads vectors from text literals; secure_file_priv is not
     # used by the harness but a stray non-empty default can block server-side
     # file ops during init, so pin it empty (matches the reference harness).
@@ -90,7 +107,16 @@ start_server() {
   # init.sql performs the extension install + gate PERSISTs. It must run before
   # the harness connects; --init-file runs it during startup as a privileged
   # bootstrap connection, so INSTALL EXTENSION and SET PERSIST are permitted.
-  [[ -f "$INIT_SQL" ]] && args+=( --init-file="$INIT_SQL" )
+  # Run it ONLY on first boot: INSTALL EXTENSION is not idempotent and would
+  # abort a restart on a persisted datadir. The SET PERSISTs it also does are
+  # written to mysqld-auto.cnf, so they survive restarts without re-running.
+  # Override with VB_FORCE_INIT=1 to force it (e.g. after wiping the catalog).
+  if [[ -f "$INIT_SQL" ]] && { [[ "$FRESH_INIT" == "1" ]] || [[ "${VB_FORCE_INIT:-0}" == "1" ]]; }; then
+    log "running init.sql (fresh datadir or VB_FORCE_INIT)"
+    args+=( --init-file="$INIT_SQL" )
+  else
+    log "skipping init.sql (datadir already initialised; extension + gates persist)"
+  fi
   # --no-defaults must be first; strip any duplicate from VB_SERVER_ARGS.
   if [[ -n "${VB_SERVER_ARGS:-}" ]]; then
     for _arg in ${VB_SERVER_ARGS}; do

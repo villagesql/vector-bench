@@ -116,7 +116,12 @@ server:
     - --mysql-native-password=ON
   normalized:
     - --innodb-buffer-pool-size={buffer_bytes}
-    - --innodb-flush-log-at-trx-commit=2
+    # flush-log-at-trx-commit=0: redo is written+flushed once per second and
+    # commits never touch the log — the closest InnoDB analog to pgvector's
+    # fsync=off + synchronous_commit=off, so the build comparison is on matched
+    # (relaxed) durability rather than charging VillageSQL for per-commit redo
+    # that pgvector does not pay. (Was =2, which still writes redo per commit.)
+    - --innodb-flush-log-at-trx-commit=0
     - --innodb-doublewrite=0
     # Matches MariaDB/AliSQL so the isolation level is identical across the
     # MySQL-family engines (AliSQL VIDX actually requires READ-COMMITTED; here

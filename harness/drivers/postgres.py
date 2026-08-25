@@ -120,6 +120,42 @@ class PostgresDriver(EngineDriver):
         threads = max(1, threads)
         start = time.perf_counter()
 
+        # In INCREMENTAL mode the HNSW index already exists, so the load is the
+        # per-row graph-build comparison against the MySQL-family engines. Those
+        # engines are driven through batched INSERT, whereas pgvector's natural
+        # ingest is COPY — a bulk fast-path that makes the ingest half of the
+        # measurement not comparable. To isolate graph-build cost from the
+        # ingest mechanism, incremental mode is driven through batched INSERT at
+        # the same batch size the MySQL-family drivers use (1000). BULK mode
+        # keeps COPY: there the index is created afterwards, so the load is pure
+        # ingest and COPY is pgvector's legitimate, idiomatic path.
+        incremental = bool(self._index and self._index.build_mode == "incremental")
+        insert_sql = f"INSERT INTO {TABLE} (id, tag, embedding) VALUES (%s, %s, %s)"
+        BATCH = 1000
+
+        def insert_range(lo: int, hi: int, cur, report: bool = False) -> None:
+            span = hi - lo
+            began = time.perf_counter()
+            next_report = began + PROGRESS_INTERVAL_S
+            rows = []
+            for i in range(lo, hi):
+                rows.append((start_id + i, int(tags[i]), vectors[i]))
+                if len(rows) >= BATCH:
+                    cur.executemany(insert_sql, rows)
+                    rows = []
+                    if report:
+                        now = time.perf_counter()
+                        if now >= next_report:
+                            done = i - lo + 1
+                            rate = done / max(now - began, 1e-9)
+                            eta = (span - done) / max(rate, 1e-9)
+                            print(f"[pgvector]   {done:,}/{span:,} rows, "
+                                  f"{rate:,.0f} rows/s (INSERT), ETA {eta / 60:.1f} min",
+                                  flush=True)
+                            next_report = now + PROGRESS_INTERVAL_S
+            if rows:
+                cur.executemany(insert_sql, rows)
+
         def copy_range(lo: int, hi: int, cur, report: bool = False) -> None:
             span = hi - lo
             began = time.perf_counter()
@@ -138,8 +174,10 @@ class PostgresDriver(EngineDriver):
                                   flush=True)
                             next_report = now + PROGRESS_INTERVAL_S
 
+        load_range = insert_range if incremental else copy_range
+
         if threads == 1:
-            copy_range(0, total, self._cur, report=True)
+            load_range(0, total, self._cur, report=True)
         else:
             bounds = [(total * i // threads, total * (i + 1) // threads)
                       for i in range(threads)]
@@ -148,7 +186,7 @@ class PostgresDriver(EngineDriver):
                 lo, hi = bound
                 conn = self._open()
                 try:
-                    copy_range(lo, hi, conn.cursor(), report=(lo == 0))
+                    load_range(lo, hi, conn.cursor(), report=(lo == 0))
                 finally:
                     conn.close()
 
