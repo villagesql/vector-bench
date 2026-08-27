@@ -409,18 +409,20 @@ def _supported_workloads(requested: List[str], engine: str,
     """
     caps = {
         "churn": ("delete_supported",
-                  "DELETE not supported (would crash the server)"),
+                  "DELETE not supported (would error / crash the server)"),
         "filtered": ("filtered_search",
                      "filtered search not supported (WHERE ignored -> ~0 recall)"),
     }
+    # The capability flags live under the engine yaml's `capabilities:` block.
+    cap_cfg = engine_cfg.get("capabilities", {}) or {}
     kept: List[str] = []
     for w in requested:
         flag_reason = caps.get(w)
         if flag_reason is not None:
             flag, reason = flag_reason
-            if not engine_cfg.get(flag, True):
+            if not cap_cfg.get(flag, True):
                 print(f"[ops] {engine}: skipping '{w}' workload -- {reason} "
-                      f"(engine config {flag}=false)")
+                      f"(capabilities.{flag}=false)")
                 continue
         kept.append(w)
     return kept
