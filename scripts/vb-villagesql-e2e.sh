@@ -39,14 +39,10 @@ VENV_PY="$HOME/ann-benchmarks/.venv/bin/python"
 PY="$([[ -x "$VENV_PY" ]] && echo "$VENV_PY" || command -v python3)"
 
 RUNTIME_IMG="vector-bench/villagesql-runtime:latest"
-GATE_CONTAINER="vb-e2e-smoke"
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 say() { printf '[vb-e2e %s] %s\n' "$(ts)" "$*"; }
-die() { printf '[vb-e2e %s] FATAL: %s\n' "$(ts)" "$*" >&2; cleanup_gate; exit 1; }
-
-cleanup_gate() { docker rm -f "$GATE_CONTAINER" >/dev/null 2>&1 || true; }
-trap cleanup_gate EXIT
+die() { printf '[vb-e2e %s] FATAL: %s\n' "$(ts)" "$*" >&2; exit 1; }
 
 say "profile=$PROFILE engines=$ENGINES python=$PY"
 
@@ -63,44 +59,23 @@ say "STAGE 2/5 build-images villagesql (server + extension, both targets)"
 bash scripts/build-images.sh --engine villagesql --target all \
   || die "build-images failed"
 
-# --- 3. smoke gate (FAIL FAST) -------------------------------------------
-say "STAGE 3/5 smoke gate: bare 'docker run server', extension + KNN must work"
-cleanup_gate
-docker run -d --name "$GATE_CONTAINER" "$RUNTIME_IMG" server >/dev/null 2>&1 \
-  || die "smoke: could not start runtime container"
-
-gsql() { docker exec "$GATE_CONTAINER" /opt/villagesql/bin/mysql \
-           --socket=/var/run/vbench/villagesql.sock "$@"; }
-
-# wait for real readiness (can actually run a query), up to ~60s
-ready=no
-for _ in $(seq 1 30); do
-  gsql -uroot -e "SELECT 1" >/dev/null 2>&1 && { ready=yes; break; }
-  sleep 2
-done
-[[ "$ready" == yes ]] || die "smoke: server never became ready (see docker logs $GATE_CONTAINER)"
-
-ext="$(gsql -uroot -N -e \
-  "SELECT COUNT(*) FROM information_schema.extensions WHERE extension_name='vsql_vector'" 2>/dev/null)"
-[[ "$ext" == "1" ]] || die "smoke: vsql_vector extension not installed (got '$ext')"
-say "smoke: extension installed"
-
-# KNN end-to-end as the bench user, index-at-CREATE-TABLE (the supported path).
-docker exec -i "$GATE_CONTAINER" /opt/villagesql/bin/mysql \
-  --socket=/var/run/vbench/villagesql.sock -ubench -pbench 2>/dev/null <<'SQL' | grep -q '^1$' \
-  || die "smoke: SVECTOR + HNSW KNN query did not return the expected row"
-SET SESSION optimizer_switch='hypergraph_optimizer=on';
-CREATE DATABASE IF NOT EXISTS vb_smoke;
-USE vb_smoke;
-DROP TABLE IF EXISTS v;
-CREATE TABLE v (id INT PRIMARY KEY, e SVECTOR(3),
-  INDEX ix (e hnsw_l2) USING EXTENDED(hnsw) WITH (M=16, ef_construction=200));
-INSERT INTO v VALUES (1,'[1,2,3]'),(2,'[9,9,9]'),(3,'[1,2,4]');
-SELECT id FROM v ORDER BY L2_DISTANCE(e, '[1,2,3]') ASC LIMIT 1;
-DROP DATABASE vb_smoke;
-SQL
-say "smoke: KNN query OK — gate PASSED"
-cleanup_gate
+# --- 3. gate (FAIL FAST) -------------------------------------------------
+# The gate IS the main path, minimal: it runs the real orchestrator on the tiny
+# `gate` profile (config/profiles/gate.yml) — real ann `_start_server`/`done()`
+# with the per-config server RESTART, real ops build — on a minimal grid. A
+# hand-rolled "boot once" check cannot mirror the ann lifecycle (it didn't:
+# villagesql got 3 ann points while every restart died "exited code 1"). Running
+# the actual code path on a 2-M grid forces the restart, so a lifecycle bug fails
+# HERE in a few minutes, not hours in. villagesql-only keeps it fast; the full
+# run's engines/profile are the STAGE-4 args.
+say "STAGE 3/5 gate: real orchestrator on the minimal 'gate' profile (villagesql)"
+GATE_RUN_ID="gate-$(date -u +%Y%m%d-%H%M%S)"
+"$PY" -m orchestrator.cli run \
+  --profile gate --engines villagesql --phases both --force \
+  --run-id "$GATE_RUN_ID" --no-report --fail-fast \
+  || die "gate FAILED — the real ann/ops path broke on the minimal profile \
+(run-id=$GATE_RUN_ID); a full run would fail the same way. See its logs."
+say "gate PASSED — ann+ops code paths healthy on the minimal profile"
 
 # --- 4. benchmark ---------------------------------------------------------
 say "STAGE 4/5 benchmark: profile=$PROFILE engines=$ENGINES (ann + ops)"
