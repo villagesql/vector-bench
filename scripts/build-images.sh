@@ -132,6 +132,25 @@ build_engine() {
     fi
   fi
 
+  # Re-stage the AUXILIARY files (Dockerfile, entrypoint, init.sql, confs) from
+  # the source tree into the build context, every build. The tars are the
+  # expensive, source-commit-pinned part and are left to prepare-sources; but the
+  # aux files are cheap and live in docker/<engine>/, so copying them here means
+  # an edit to the entrypoint or init.sql takes effect on the NEXT build with no
+  # separate prepare-sources step. Without this, build-images used whatever
+  # prepare-sources last staged — so an entrypoint fix silently did not reach the
+  # image (a stale-buildctx trap that cost real debugging time). _shared first,
+  # then the engine's own dir (which may override a shared file), matching
+  # prepare-sources' staging order. `base` resolves an alias (mariadb123 ->
+  # mariadb) so aliased versions find their aux files.
+  local base; base="$(yq_get "$cfg" alias_of "$engine")"
+  if [[ -d "$VB_DOCKER/$base" ]]; then
+    find "$VB_DOCKER/_shared" -maxdepth 1 -type f \
+         -exec cp {} "$ctx/" \; 2>/dev/null || true
+    find "$VB_DOCKER/$base" -maxdepth 1 -type f \
+         -exec cp {} "$ctx/" \; 2>/dev/null || true
+  fi
+
   # Engines we compile carry a git tag. Percona Search is a published image and
   # Valkey is a package set, so they carry a version instead and their images
   # would otherwise all be tagged ":unknown".
