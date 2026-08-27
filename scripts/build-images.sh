@@ -38,13 +38,39 @@ while [[ $# -gt 0 ]]; do
     --jobs=*) JOBS="${1#*=}"; shift ;;
     --no-cache) EXTRA_BUILD_ARGS+=(--no-cache); shift ;;
     --pull) EXTRA_BUILD_ARGS+=(--pull); shift ;;
+    # Push built images to a registry for reuse across machines. The value is a
+    # registry prefix, e.g. us-central1-docker.pkg.dev/villagesql-benchmarking/vector-bench
+    # Each image is pushed as <prefix>/<engine>-<target>:<commit-tag>, where the
+    # commit tag is the pinned source commit(s) -- immutable, so a given source
+    # always maps to the same registry tag and every machine pulls exactly it.
+    --push) PUSH_REGISTRY="$2"; shift 2 ;;
+    --push=*) PUSH_REGISTRY="${1#*=}"; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
+PUSH_REGISTRY="${PUSH_REGISTRY:-}"
 
 need_docker
 need_cmd python3
+
+# commit_tag_for <engine> -> the immutable registry tag from the source manifest.
+# Generic over any number of source repos (must match orchestrator/config.py's
+# commit_tag_for): every "<name>_commit" field, 12-char short, joined by '-' in
+# sorted-by-key order; else a single "commit". Empty if no manifest.
+commit_tag_for() {
+  local engine="$1" meta="$VB_SOURCES/${engine}.source.json"
+  [[ -f "$meta" ]] || return 0
+  python3 - "$meta" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+repo = sorted((k, v) for k, v in d.items() if k.endswith("_commit") and v)
+if repo:
+    print("-".join(str(v)[:12] for _, v in repo))
+else:
+    print((d.get("commit") or "")[:12])
+PY
+}
 
 # BuildKit is faster and gives better output, but it needs the buildx component,
 # which plenty of hosts do not have. The Dockerfiles deliberately avoid
@@ -94,8 +120,16 @@ build_engine() {
   # failed a build whose context prepare-sources had just reported ready.
   local kind; kind="$(yq_get "$cfg" source.kind "source")"
   if [[ "$kind" == "source" ]]; then
-    [[ -f "$ctx/source.tar" ]] \
-      || die "build context for $engine has no source.tar — run: scripts/prepare-sources.sh --engine $engine"
+    # VillageSQL ships two tars (server.tar + extension.tar) so the Docker build
+    # caches the server and extension compiles independently; every other source
+    # engine ships a single source.tar.
+    if [[ "$engine" == "villagesql" ]]; then
+      { [[ -f "$ctx/server.tar" && -f "$ctx/extension.tar" ]]; } \
+        || die "build context for $engine missing server.tar/extension.tar — run: scripts/prepare-sources.sh --engine $engine"
+    else
+      [[ -f "$ctx/source.tar" ]] \
+        || die "build context for $engine has no source.tar — run: scripts/prepare-sources.sh --engine $engine"
+    fi
   fi
 
   # Engines we compile carry a git tag. Percona Search is a published image and
@@ -106,6 +140,12 @@ build_engine() {
   local base;     base="$(yq_get "$cfg" image.base ubuntu:24.04)"
   local rt_image; rt_image="$(yq_get "$cfg" image.runtime "vector-bench/${engine}-runtime")"
   local bn_image; bn_image="$(yq_get "$cfg" image.bench   "vector-bench/${engine}-bench")"
+
+  # Immutable commit tag for the registry: the pinned source commit(s). Read from
+  # the source manifest prepare-sources wrote. VillageSQL has two repos, so its
+  # tag is server-ext; every other engine uses its single commit. Falls back to
+  # the human tag if no manifest (e.g. published-image engines never compiled).
+  local commit_tag; commit_tag="$(commit_tag_for "$engine")"
   local btype;    btype="$(yq_get "$cfg" build.type RelWithDebInfo)"
   local march;    march="${MARCH:-$(yq_get "$cfg" build.march x86-64-v3)}"
   local cxxextra; cxxextra="$(yq_get "$cfg" build.extra_cxxflags "")"
@@ -158,14 +198,31 @@ build_engine() {
     esac
     info "building ${img}:${tag} (target=$t, march=$march, base=$base)"
     local start; start=$(date +%s)
+    # Also tag with the immutable commit tag when we have one, so the same image
+    # is addressable by commit locally (for --image runs) and for registry push.
+    local -a commit_tag_args=()
+    [[ -n "$commit_tag" ]] && commit_tag_args=(-t "${img}:${commit_tag}")
     docker build \
       --target "$t" \
-      -t "${img}:${tag}" -t "${img}:latest" \
+      -t "${img}:${tag}" -t "${img}:latest" "${commit_tag_args[@]}" \
       -f "$VB_DOCKER/$base/Dockerfile" \
       "${bargs[@]}" "${EXTRA_BUILD_ARGS[@]}" \
       "$ctx" \
       || die "build failed for $engine target $t"
-    ok "built ${img}:${tag} in $(( $(date +%s) - start ))s"
+    ok "built ${img}:${tag}${commit_tag:+ (+${commit_tag})} in $(( $(date +%s) - start ))s"
+
+    # Push to the registry for reuse across machines, under the immutable commit
+    # tag: <registry>/<engine>-<target>:<commit_tag>. Requires `docker login` /
+    # `gcloud auth configure-docker <host>` to have been run on this machine.
+    if [[ -n "$PUSH_REGISTRY" ]]; then
+      [[ -n "$commit_tag" ]] \
+        || die "cannot --push $engine: no commit tag (no source manifest). Run prepare-sources first."
+      local remote="${PUSH_REGISTRY}/${engine}-${t}:${commit_tag}"
+      info "pushing $remote"
+      docker tag "${img}:${commit_tag}" "$remote" || die "docker tag failed: $remote"
+      docker push "$remote" || die "docker push failed: $remote (is the registry auth configured?)"
+      ok "pushed $remote"
+    fi
   done
 
   # Record what was actually built, for the run manifest.

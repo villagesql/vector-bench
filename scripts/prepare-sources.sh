@@ -255,31 +255,37 @@ prepare_villagesql() {
   local srv_ref;  srv_ref="$(yq_get "$cfg" source.server_ref tomas/deb-6-optimizer-scan)"
   local ext_repo; ext_repo="$(yq_get "$cfg" source.extension_repo https://github.com/villagesql/vsql-vector.git)"
   local ext_ref;  ext_ref="$(yq_get "$cfg" source.extension_ref tomas/deb-absolute-minimal-bridge)"
-  local tar="$VB_SOURCES/villagesql-${tag}.tar"
+  # Two SEPARATE tarballs (not one concatenated source.tar) so the Docker build
+  # can COPY them as independent layers: the server tar before the ~30-min server
+  # compile, the extension tar after it. An extension-only change then busts only
+  # the extension COPY + compile layers, leaving the server compile cached
+  # (~35 min -> ~2 min for a vsql-vector iteration). The reuse fingerprint is
+  # per-tar (srv_sha / ext_sha), so each is rebuilt only when its own repo moved.
+  local srv_tar="$VB_SOURCES/villagesql-server-${tag}.tar"
+  local ext_tar="$VB_SOURCES/villagesql-extension-${tag}.tar"
 
   _vsql_ensure_branch villagesql-server "$srv_repo" "$srv_ref"
   local srv_dir="$_VSQL_DIR" srv_sha="$_VSQL_SHA" srv_origin="$_VSQL_ORIGIN" srv_gitref="$_VSQL_REF"
   _vsql_ensure_branch vsql-vector "$ext_repo" "$ext_ref"
   local ext_dir="$_VSQL_DIR" ext_sha="$_VSQL_SHA" ext_origin="$_VSQL_ORIGIN" ext_gitref="$_VSQL_REF"
 
-  # Fingerprint = both commits; reuse the tarball only when neither moved.
-  local combined_sha; combined_sha="$(vb_hash "$srv_sha $ext_sha")"
-  if tarball_current villagesql "$combined_sha" "$tar"; then
-    ok "villagesql: source tarball up to date ($(human_bytes "$(stat -c%s "$tar")"))"
-    stage_context villagesql "$tar"; return
+  if [[ $FORCE -eq 0 && -f "$srv_tar" && "$(_vsql_meta_field server_commit)" == "$srv_sha" ]]; then
+    ok "villagesql: server tar up to date (${srv_sha:0:12})"
+  else
+    info "villagesql: exporting server $srv_ref (${srv_sha:0:12}) from $srv_dir"
+    git -C "$srv_dir" archive --format=tar --prefix=source/ "$srv_gitref" > "$srv_tar.tmp"
+    mv "$srv_tar.tmp" "$srv_tar"
   fi
 
-  info "villagesql: exporting server $srv_ref (${srv_sha:0:12}) from $srv_dir"
-  git -C "$srv_dir" archive --format=tar --prefix=source/ "$srv_gitref" > "$tar.tmp"
-  info "villagesql: appending extension $ext_ref (${ext_sha:0:12}) from $ext_dir"
-  # git archive can only write a whole tar; build the extension tar separately
-  # and concatenate (both are ustar streams; tar handles the concatenation when
-  # we use --concatenate on the first).
-  local ext_tar="$tar.ext.tmp"
-  git -C "$ext_dir" archive --format=tar --prefix=extension/ "$ext_gitref" > "$ext_tar"
-  tar --concatenate --file "$tar.tmp" "$ext_tar"
-  rm -f "$ext_tar"
-  mv "$tar.tmp" "$tar"
+  if [[ $FORCE -eq 0 && -f "$ext_tar" && "$(_vsql_meta_field extension_commit)" == "$ext_sha" ]]; then
+    ok "villagesql: extension tar up to date (${ext_sha:0:12})"
+  else
+    info "villagesql: exporting extension $ext_ref (${ext_sha:0:12}) from $ext_dir"
+    git -C "$ext_dir" archive --format=tar --prefix=extension/ "$ext_gitref" > "$ext_tar.tmp"
+    mv "$ext_tar.tmp" "$ext_tar"
+  fi
+
+  local combined_sha; combined_sha="$(vb_hash "$srv_sha $ext_sha")"
 
   # Record both commits. record_meta stores one commit; VillageSQL needs two, so
   # write a richer meta file directly (the reuse check reads .commit).
@@ -294,7 +300,35 @@ json.dump({"engine": "villagesql", "tag": tag, "commit": combined,
 open(out, "a").write("\n")
 PY
   ok "villagesql: server=${srv_sha:0:12} extension=${ext_sha:0:12} tag=$tag"
-  stage_context villagesql "$tar"
+  _stage_villagesql_context "$srv_tar" "$ext_tar"
+}
+
+# Read a field from the villagesql source meta written last run (empty if none).
+# Used by the per-tar reuse checks so each tar is rebuilt only when its own
+# commit moved, independent of the other repo.
+_vsql_meta_field() {
+  local field="$1" meta="$VB_SOURCES/villagesql.source.json"
+  [[ -f "$meta" ]] || return 0
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' \
+    "$meta" "$field" 2>/dev/null || true
+}
+
+# Stage the villagesql build context with the server + extension tars as two
+# separate files, so the Dockerfile COPYs them as independent cache layers.
+# Mirrors stage_context's aux-file handling.
+_stage_villagesql_context() {
+  local srv_tar="$1" ext_tar="$2"
+  local ctx="$VB_BUILDCTX/villagesql"
+  mkdir -p "$ctx"
+  rm -f "$ctx/server.tar" "$ctx/extension.tar" "$ctx/source.tar"
+  ln "$srv_tar" "$ctx/server.tar"    2>/dev/null || cp "$srv_tar" "$ctx/server.tar"
+  ln "$ext_tar" "$ctx/extension.tar" 2>/dev/null || cp "$ext_tar" "$ctx/extension.tar"
+  find "$VB_DOCKER/_shared" -maxdepth 1 -type f \
+       -exec cp {} "$ctx/" \; 2>/dev/null || true
+  find "$VB_DOCKER/villagesql" -maxdepth 1 -type f ! -name 'Dockerfile' \
+       -exec cp {} "$ctx/" \; 2>/dev/null || true
+  cp "$VB_DOCKER/villagesql/Dockerfile" "$ctx/Dockerfile"
+  ok "villagesql: build context ready at $ctx (server.tar + extension.tar)"
 }
 
 # ---------------------------------------------------------------------------

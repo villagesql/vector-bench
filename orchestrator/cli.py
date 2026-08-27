@@ -843,6 +843,8 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
         return ann_pass.run_engine(
             engine, dataset, profile, engine_cfg, resolved, resource_pass,
             paths, run_id, force=args.force,
+            registry=getattr(args, "registry", None),
+            image_override=getattr(args, "image", None),
         )
 
     if phase == "ops":
@@ -896,7 +898,9 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
                     )
                     with ops_pass.OpsRun(engine, engine_cfg, resolved,
                                          resource_pass, paths, run_id,
-                                         dataset, tag) as run:
+                                         dataset, tag,
+                                         registry=getattr(args, "registry", None),
+                                         image_override=getattr(args, "image", None)) as run:
                         rc = run.run_harness(harness_args, output,
                                              memory_timeseries=memory_ts)
                     if rc == 0 and checkpoints is not None:
@@ -971,6 +975,18 @@ def build_parser() -> argparse.ArgumentParser:
                      help="normalized, tuned, or both "
                           "(default: the profile's choice, else both)")
     run.add_argument("--phases", default="both", choices=("ann", "ops", "both"))
+    # Run from a prebuilt image instead of a locally-built one, so the same image
+    # can be benchmarked across machines (build once + push, then pull+run here).
+    run.add_argument("--registry", default=None,
+                     help="registry prefix to PULL engine images from, e.g. "
+                          "REGION-docker.pkg.dev/PROJECT/REPO. Image resolved as "
+                          "<registry>/<engine>-<runtime|bench>:<commit-tag>; "
+                          "prepare-sources (for the commit tag) is still needed, "
+                          "but the local source build is skipped.")
+    run.add_argument("--image", default=None,
+                     help="explicit image name to run for the (single) engine, "
+                          "bypassing build and registry resolution entirely; "
+                          "pulled if absent. Use with one --engine.")
     run.add_argument("--run-id", default=None)
     run.add_argument("--resume", action="store_true",
                      help="skip units already recorded complete in the run dir")

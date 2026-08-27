@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from . import docker_ctl
-from .config import ResolvedResources, server_args
+from .config import ResolvedResources, resolve_image, server_args
 
 # Constructor class names, as ann-benchmarks expects them in config.yml.
 CONSTRUCTORS = {"mariadb": "MariaDB", "mariadb123": "MariaDB123",
@@ -319,14 +319,18 @@ def client_memory_bytes(datasets_dir: str, dataset: str) -> int:
 def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
                engine_cfg: Dict[str, Any], resolved: ResolvedResources,
                resource_pass: str, paths: Dict[str, str], run_id: str,
-               force: bool = False, timeout_s: int = 24 * 3600) -> int:
+               force: bool = False, timeout_s: int = 24 * 3600,
+               registry: Optional[str] = None,
+               image_override: Optional[str] = None) -> int:
     """Run the ann-benchmarks sweep for one engine on one dataset."""
-    image = engine_cfg.get("image", {}).get("bench", f"vector-bench/{engine}-bench")
-    if not docker_ctl.image_exists(image):
+    ref = resolve_image(engine, engine_cfg, "bench",
+                        registry=registry, image_override=image_override)
+    image = ref.name
+    if not docker_ctl.ensure_image(image, allow_pull=ref.allow_pull):
+        hint = (f"  docker pull {image}" if ref.allow_pull
+                else f"  ./run-benchmark.sh build --engines {engine}")
         raise docker_ctl.DockerError(
-            f"image {image} not found. Build it first:\n"
-            f"  ./run-benchmark.sh build --engines {engine}"
-        )
+            f"image {image} not available. Get it first:\n{hint}")
 
     flags = server_args(engine_cfg, resource_pass, resolved)
     container = f"{run_id}-annb-{engine}-{dataset}".replace("_", "-")[:60]

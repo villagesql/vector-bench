@@ -8,9 +8,10 @@
 #   bench    — runtime + the Python stack ann-benchmarks drives.
 #
 # Build context is work/buildctx/villagesql/, produced by prepare-sources.sh.
-# It carries ONE source.tar holding two trees:
-#   source/     the villagesql-server branch
-#   extension/  the vsql-vector branch
+# It carries TWO tars, copied as separate layers so the server and extension
+# compiles cache independently (a vsql-vector-only change skips the server build):
+#   server.tar     -> source/     the villagesql-server branch
+#   extension.tar  -> extension/  the vsql-vector branch
 #
 # Two compiles happen in the builder stage: the server first (RelWithDebInfo),
 # then the extension (Release) against the server's *build tree* — the extension
@@ -41,9 +42,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 file git ca-certificates
 
 WORKDIR /build
-COPY source.tar /tmp/source.tar
-RUN tar -xf /tmp/source.tar -C /build && rm -f /tmp/source.tar
-# -> /build/source (server), /build/extension (vsql_vector)
+# The server and extension sources arrive as TWO separate tars, copied as two
+# layers so their compiles cache independently. The server tar is copied here,
+# before the ~30-min server compile below; the extension tar is copied later,
+# after that compile, so an extension-only change (new vsql-vector commit) does
+# NOT invalidate the cached server-compile layer.
+COPY server.tar /tmp/server.tar
+RUN tar -xf /tmp/server.tar -C /build && rm -f /tmp/server.tar
+# -> /build/source (server)
 
 # --- 1. Server (RelWithDebInfo, optimized) --------------------------------
 # INSTALL_LAYOUT=STANDALONE puts the veb dir at <prefix>/lib/veb, which is where
@@ -73,6 +79,13 @@ RUN set -eux; \
     make -j"$JOBS" sdk; \
     ls -d /build/source/build/villagesql-extension-sdk-* >/dev/null \
       || { echo "FATAL: extension SDK not staged by 'make sdk'"; exit 1; }
+
+# Extension source copied AFTER the server compile, as its own layer. A new
+# vsql-vector commit changes only this tar, so Docker reuses the cached server
+# build above and re-runs only the extension compile below (~35 min -> ~2 min).
+COPY extension.tar /tmp/extension.tar
+RUN tar -xf /tmp/extension.tar -C /build && rm -f /tmp/extension.tar
+# -> /build/extension (vsql_vector)
 
 # --- 2. Extension (Release, MUST be optimized) ----------------------------
 # Built against the server BUILD tree (VillageSQL_BUILD_DIR), not the install

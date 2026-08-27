@@ -23,6 +23,14 @@ import yaml
 VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR = os.path.join(VB_ROOT, "config")
 
+
+@dataclass
+class ImageRef:
+    """An image to run, and whether the caller may docker-pull it if absent.
+    allow_pull is True for registry/prebuilt images (not built locally)."""
+    name: str
+    allow_pull: bool = False
+
 GB = 1024 ** 3
 
 
@@ -74,6 +82,75 @@ def merge_resource_overrides(resources: Dict[str, Any],
 
 def load_engine(name: str) -> Dict[str, Any]:
     return _load(os.path.join(CONFIG_DIR, "engines", f"{name}.yml"))
+
+
+SOURCES_DIR = os.path.join(VB_ROOT, "sources")
+
+
+def commit_tag_for(engine: str) -> str:
+    """Immutable registry tag for an engine, from its source manifest.
+
+    Generic over any number of source repos: an engine with a single repo
+    records "commit"; a multi-repo engine (e.g. villagesql: server + extension)
+    records "<name>_commit" per repo. The tag is the 12-char short of each,
+    joined by '-' in a STABLE order (multi-repo fields sorted by key, so the tag
+    is deterministic regardless of manifest key order). A single "commit" is used
+    alone. Returns "" when there is no manifest (a published-image engine that is
+    never compiled) or no commit fields."""
+    import json
+    meta = os.path.join(SOURCES_DIR, f"{engine}.source.json")
+    if not os.path.exists(meta):
+        return ""
+    try:
+        d = json.load(open(meta))
+    except (OSError, ValueError):
+        return ""
+    # Multi-repo: every "<name>_commit" field, sorted by name for stability.
+    repo_commits = sorted((k, v) for k, v in d.items()
+                          if k.endswith("_commit") and v)
+    if repo_commits:
+        parts = [str(v)[:12] for _, v in repo_commits]
+        return "-".join(parts)
+    # Single-repo fallback.
+    return (d.get("commit") or "")[:12]
+
+
+def resolve_image(engine: str, engine_cfg: Dict[str, Any], variant: str,
+                  registry: Optional[str] = None,
+                  image_override: Optional[str] = None) -> "ImageRef":
+    """Resolve the image to run for an engine's `variant` (runtime|bench).
+
+    Priority:
+      1. image_override (--image / image.prebuilt): use it verbatim, no build.
+      2. registry (--registry / image.registry): pull
+         <registry>/<engine>-<variant>:<commit_tag> from the registry.
+      3. local default (image.runtime / image.bench): built locally, no pull.
+
+    Returns an ImageRef(name, allow_pull) -- allow_pull True means the caller
+    should docker-pull it if absent rather than erroring 'build it first'.
+    """
+    img_cfg = engine_cfg.get("image", {}) or {}
+    default = img_cfg.get(variant, f"vector-bench/{engine}-{variant}")
+
+    override = image_override or img_cfg.get("prebuilt")
+    if override:
+        # A single explicit image name is a runtime image; for the bench variant
+        # allow a per-variant override via image.prebuilt_bench, else reuse it.
+        if variant == "bench":
+            override = img_cfg.get("prebuilt_bench", override)
+        return ImageRef(name=override, allow_pull=True)
+
+    reg = registry or img_cfg.get("registry")
+    if reg:
+        tag = commit_tag_for(engine)
+        if not tag:
+            raise ValueError(
+                f"{engine}: cannot use registry image without a commit tag "
+                f"(no sources/{engine}.source.json). Run prepare-sources first, "
+                f"or pass an explicit --image.")
+        return ImageRef(name=f"{reg}/{engine}-{variant}:{tag}", allow_pull=True)
+
+    return ImageRef(name=default, allow_pull=False)
 
 
 def available_profiles() -> List[str]:

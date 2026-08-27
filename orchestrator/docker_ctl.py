@@ -69,6 +69,25 @@ def image_id(image: str) -> str:
         return "unknown"
 
 
+def pull(image: str, timeout: int = 1800) -> None:
+    """Pull an image from its registry. Raises DockerError on failure."""
+    _run(["docker", "pull", image], timeout=timeout)
+
+
+def ensure_image(image: str, allow_pull: bool = False) -> bool:
+    """Make `image` available locally. If missing and allow_pull, docker pull it.
+    Returns True if the image is present afterwards, False otherwise."""
+    if image_exists(image):
+        return True
+    if not allow_pull:
+        return False
+    try:
+        pull(image)
+    except DockerError:
+        return False
+    return image_exists(image)
+
+
 # ---------------------------------------------------------------------------
 # Networks and volumes
 # ---------------------------------------------------------------------------

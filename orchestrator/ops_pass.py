@@ -20,7 +20,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from . import docker_ctl
-from .config import ResolvedResources, server_args
+from .config import ResolvedResources, resolve_image, server_args
 from .manifest import utcnow
 
 DEFAULT_PORTS = {"mariadb": 3306, "mariadb123": 3306,
@@ -147,7 +147,9 @@ class OpsRun:
 
     def __init__(self, engine: str, engine_cfg: Dict[str, Any],
                  resolved: ResolvedResources, resource_pass: str,
-                 paths: Dict[str, str], run_id: str, dataset: str, tag: str):
+                 paths: Dict[str, str], run_id: str, dataset: str, tag: str,
+                 registry: Optional[str] = None,
+                 image_override: Optional[str] = None):
         self.engine = engine
         self.engine_cfg = engine_cfg
         self.resolved = resolved
@@ -156,6 +158,10 @@ class OpsRun:
         self.run_id = run_id
         self.dataset = dataset
         self.tag = tag
+        # Registry pull / explicit image override for run-from-registry across
+        # machines (build once, push, pull-and-run). None -> local built image.
+        self.registry = registry
+        self.image_override = image_override
 
         safe = f"{run_id}-{engine}-{tag}".replace("_", "-").replace(".", "-")[:55]
         self.network = f"{safe}-net"
@@ -182,14 +188,15 @@ class OpsRun:
         self.teardown()
 
     def _start_server(self) -> None:
-        image = self.engine_cfg.get("image", {}).get(
-            "runtime", f"vector-bench/{self.engine}-runtime"
-        )
-        if not docker_ctl.image_exists(image):
+        ref = resolve_image(
+            self.engine, self.engine_cfg, "runtime",
+            registry=self.registry, image_override=self.image_override)
+        image = ref.name
+        if not docker_ctl.ensure_image(image, allow_pull=ref.allow_pull):
+            hint = (f"  docker pull {image}" if ref.allow_pull
+                    else f"  ./run-benchmark.sh build --engines {self.engine}")
             raise docker_ctl.DockerError(
-                f"image {image} not found. Build it first:\n"
-                f"  ./run-benchmark.sh build --engines {self.engine}"
-            )
+                f"image {image} not available. Get it first:\n{hint}")
 
         flags = server_args(self.engine_cfg, self.resource_pass, self.resolved)
         data_mount = ("/var/lib/postgresql" if self.engine == "pgvector"
