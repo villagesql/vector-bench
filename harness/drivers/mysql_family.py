@@ -490,10 +490,22 @@ class VillageSQLDriver(MySQLFamilyDriver):
     # --- inserts bind text, not binary ---------------------------------------
 
     def _load_range(self, cur, vectors, tags, start_id, lo, hi, batch=1000, report=False):
-        # Same batched loader as the base, but binding the vector as a text
-        # literal and a larger default batch (text vectors are bigger, but 1000 x
-        # 784-dim stays well under the 1 GB max_allowed_packet the server sets).
-        sql = f"INSERT INTO {TABLE} (id, tag, v) VALUES (%s, %s, %s)"
+        # Binds the vector as a text literal (SVECTOR takes '[...]'). Each batch
+        # is ONE multi-row INSERT ... VALUES (..),(..),..(..) -- NOT executemany
+        # over a single-row template. The mariadb Connector/Python (1.1.x) bulks
+        # executemany only on the binary-param path; with a text-literal param it
+        # falls back to one INSERT statement PER ROW (measured: Com_insert == row
+        # count, not batch count). Building the multi-row VALUES ourselves yields
+        # one server statement per batch regardless -- matching vector-dev-bench,
+        # and the binary-param bulk the base driver's MariaDB/AliSQL already get.
+        # 1000 x 784-dim text stays well under the server's 1 GB max_allowed_packet.
+        def flush(batch_rows: List[Tuple[int, int, str]]) -> None:
+            if not batch_rows:
+                return
+            values = ",".join(["(%s, %s, %s)"] * len(batch_rows))
+            params = [field for row in batch_rows for field in row]
+            cur.execute(f"INSERT INTO {TABLE} (id, tag, v) VALUES {values}", params)
+
         rows: List[Tuple[int, int, str]] = []
         total = hi - lo
         started = time.perf_counter()
@@ -501,7 +513,7 @@ class VillageSQLDriver(MySQLFamilyDriver):
         for i in range(lo, hi):
             rows.append((start_id + i, int(tags[i]), _to_text_bracket(vectors[i])))
             if len(rows) >= batch:
-                cur.executemany(sql, rows)
+                flush(rows)
                 rows = []
                 now = time.perf_counter()
                 if report and now >= next_report:
@@ -511,8 +523,7 @@ class VillageSQLDriver(MySQLFamilyDriver):
                     print(f"[{self.name}]   {done:,}/{total:,} rows, "
                           f"{rate:,.0f} rows/s, ETA {eta / 60:.1f} min", flush=True)
                     next_report = now + PROGRESS_INTERVAL_S
-        if rows:
-            cur.executemany(sql, rows)
+        flush(rows)
         cur.execute("COMMIT")
 
     def insert_rows(self, ids, vectors, tags) -> None:
