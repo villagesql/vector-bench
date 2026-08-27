@@ -21,19 +21,12 @@ SET PERSIST vsql_allow_preview_extensions = ON;
 -- sets it per session as a belt-and-braces measure.
 SET PERSIST optimizer_switch = 'hypergraph_optimizer=on';
 
--- Install the SVECTOR + HNSW extension, discovered by name from lib/veb. Only
--- ONE extension that registers the SVECTOR type may be installed: two make type
--- resolution ambiguous and the server asserts.
---
--- This file runs via --init-file, which the SERVER reads one statement at a
--- time and ABORTS startup on any error. INSTALL EXTENSION persists across
--- restarts, so on a persisted datadir a second run would error "already
--- installed" and wedge the server. It also cannot be wrapped in a prepared
--- statement (ER 1295, "not supported in the prepared statement protocol") or a
--- DELIMITER-based procedure (--init-file doesn't parse client DELIMITER). So
--- idempotency is handled OUTSIDE the SQL: the entrypoint passes --init-file
--- ONLY on the first boot (fresh datadir), never on a restart. A plain
--- INSTALL EXTENSION is therefore correct and safe here.
-INSTALL EXTENSION vsql_vector;
+-- NOTE: INSTALL EXTENSION vsql_vector is intentionally NOT here. This file runs
+-- via --init-file on EVERY boot, and --init-file aborts startup on any error;
+-- INSTALL is not idempotent (errors "already installed" on a persisted datadir)
+-- and cannot be IF-guarded in --init-file (no conditional DDL / DELIMITER; not
+-- preparable, ER 1295). The entrypoint therefore installs the extension AFTER
+-- the server is up, tolerating "already installed" (|| true). Everything left in
+-- this file is idempotent and safe to re-run on every boot.
 
 FLUSH PRIVILEGES;
