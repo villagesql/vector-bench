@@ -89,10 +89,25 @@ VILLAGESQL = Dialect(
 class VillageSQL(VBMySQLBase):
     dialect = VILLAGESQL
 
+    # vsql-vector caps ef_construction at MAX_EF_CONSTRUCTION_FACTOR * M
+    # (src/index/hnsw/storage.cc: max_ef_construction = M * 32). A request above
+    # that cap is rejected at CREATE INDEX ("ef_construction exceeds maximum
+    # allowed value ... for M="), which for small M (e.g. M=6 -> max 192) fails a
+    # grid that asks for ef_construction=200. Clamp to the per-M maximum so every
+    # M value benchmarks; the effective value is recorded in get_additional()
+    # (see _ef_construction_requested) so results stay honest about what ran.
+    _MAX_EF_CONSTRUCTION_FACTOR = 32
+
     def __init__(self, metric, method_param):
         # method_param carries M and (VillageSQL only) ef_construction.
-        self._ef_construction = int(method_param.get("ef_construction", 200))
-        super().__init__(metric, method_param)
+        self._ef_construction_requested = int(method_param.get("ef_construction", 200))
+        super().__init__(metric, method_param)  # sets self._m
+        max_ef = self._MAX_EF_CONSTRUCTION_FACTOR * self._m
+        self._ef_construction = min(self._ef_construction_requested, max_ef)
+        if self._ef_construction != self._ef_construction_requested:
+            print(f"[vb] villagesql: ef_construction {self._ef_construction_requested} "
+                  f"exceeds max {max_ef} for M={self._m}; clamped to {self._ef_construction}",
+                  file=sys.stderr)
         mod, fn, order = _METRICS[self._metric]  # self._metric is the mapped key
         self._idx_modifier = mod
         self._distance_fn = fn
@@ -304,6 +319,15 @@ class VillageSQL(VBMySQLBase):
                 return fh.read().strip()
         except OSError:
             return "unknown"
+
+    def get_additional(self) -> dict:
+        # Extend the base record with the ef_construction actually used vs what
+        # the grid requested, so a clamp (ef_construction > 32*M for small M) is
+        # visible in the results rather than silently altering the build knob.
+        extra = super().get_additional()
+        extra["ef_construction"] = self._ef_construction
+        extra["ef_construction_requested"] = self._ef_construction_requested
+        return extra
 
     def __str__(self) -> str:
         return (
