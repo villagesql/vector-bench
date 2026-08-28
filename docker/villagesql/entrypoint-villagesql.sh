@@ -122,7 +122,7 @@ initialise() {
     --datadir="$DATA_DIR"
     --socket=/var/run/vbench/bootstrap.sock
     --skip-networking
-    --mysqlx=OFF
+    --skip-mysqlx
     --log-error="$LOG_FILE"
     --pid-file=/var/run/vbench/bootstrap.pid
     --skip-name-resolve
