@@ -124,21 +124,39 @@ start_server() {
   # then hand the container's foreground to it via `wait` (so it stays effectively
   # PID 1 and receives signals). exec-ing mysqld directly would leave no point at
   # which to run the post-start install.
-  log "starting $MYSQLD ${args[*]}"
-  "$MYSQLD" "${args[@]}" &
-  local mysqld_pid=$!
-
-  # Wait for the server to accept connections, then install the extension
-  # tolerantly. INSTALL EXTENSION persists in the catalog, so on a restart the
-  # extension is already present and this INSTALL errors "already installed" —
-  # which we swallow (|| true). Either way the extension is available afterwards.
-  local ready=0 _i
-  for _i in $(seq 1 60); do
-    if "$(find_bin mysql)" --no-defaults -uroot --socket="$SOCKET" \
-         -e "SELECT 1" >/dev/null 2>&1; then ready=1; break; fi
-    # if mysqld died during startup, stop waiting and let the container exit
-    kill -0 "$mysqld_pid" 2>/dev/null || break
-    sleep 1
+  #
+  # RESTART RACE: the ann harness restarts the server per config (SHUTDOWN, then a
+  # fresh entrypoint on the SAME datadir). A previous mysqld can still be releasing
+  # its InnoDB file locks (dblwr / ibdata) when the new one starts, so the new one
+  # dies with "Unable to lock ./#ib_16384_0.dblwr error: 11" (EAGAIN) and the ann
+  # run reports "server exited during startup with code 1". The old server frees
+  # the locks within ~1s, so retry the launch a few times before giving up.
+  local mysqld_pid ready=0 _i attempt
+  for attempt in 1 2 3 4 5; do
+    log "starting (attempt $attempt) $MYSQLD ${args[*]}"
+    "$MYSQLD" "${args[@]}" &
+    mysqld_pid=$!
+    ready=0
+    for _i in $(seq 1 60); do
+      if "$(find_bin mysql)" --no-defaults -uroot --socket="$SOCKET" \
+           -e "SELECT 1" >/dev/null 2>&1; then ready=1; break; fi
+      # mysqld died during startup — stop waiting; retry if a lock race, else fail.
+      kill -0 "$mysqld_pid" 2>/dev/null || break
+      sleep 1
+    done
+    [[ "$ready" == "1" ]] && break
+    # Not ready: if mysqld exited on the transient InnoDB lock error, wait for the
+    # old server to finish releasing and retry. Any other exit is a real failure.
+    wait "$mysqld_pid" 2>/dev/null || true
+    # Look only at the tail so a lock error from an earlier attempt does not
+    # trigger a spurious retry.
+    if tail -5 "$LOG_FILE" 2>/dev/null | grep -q "Unable to lock .*error: 11" \
+       && [[ "$attempt" -lt 5 ]]; then
+      log "startup lost the InnoDB lock race (old server still exiting); retrying in 2s"
+      sleep 2
+      continue
+    fi
+    break
   done
   if [[ "$ready" == "1" ]]; then
     for ext in ${VB_EXTENSIONS:-vsql_vector}; do
