@@ -29,9 +29,14 @@ runs: 1
 
 ann:
   enabled: true
-  # TWO M values on purpose: forces the per-config server restart (the lifecycle
-  # the single-M smoke never exercised). Keep ef_search to one point for speed.
-  m_values: [8, 16]
+  # MULTIPLE M values on purpose. Each is a separate ann config, and the harness
+  # STOPS and RESTARTS the server between configs on the same persisted datadir.
+  # A single M never restarts (the old smoke's blind spot); TWO restarts once,
+  # which only SAMPLES an intermittent restart race — it can pass by luck. FIVE M
+  # values give 4 restarts per pass (×2 passes = 8), enough to reliably trip a
+  # race that fires only some of the time. ef_search stays a single point for
+  # speed — the restart count, not the query grid, is what this gate is for.
+  m_values: [6, 8, 16, 24, 32]
   ef_search: [40]
   pgvector_ef_construction: 200
   # Exercise both pgvector build modes (post = bulk, incremental = per-INSERT),

@@ -10,7 +10,14 @@
 # VillageSQL is MySQL 8.4.10 based, so initialisation is
 # `mysqld --initialize-insecure` (like AliSQL, unlike MariaDB).
 #
-# vsql_vector specifics, all handled by init.sql (see there for the why):
+# The datadir is bootstrapped ONCE, in two phases (see initialise()): phase 1
+# --initialize, phase 2 a one-shot start that PERSISTs the preview gate + the
+# hypergraph optimizer, creates the bench account, and INSTALLs vsql_vector — all
+# durable in the datadir. After that a normal start is a plain `exec mysqld`: no
+# --init-file, no preview switch, no post-start install. This matches MariaDB's
+# lifecycle and is what makes the ann harness's per-config restart race-free.
+#
+# vsql_vector specifics (all set up in phase 2):
 #   * SET PERSIST vsql_allow_preview_extensions = ON  — required to install/use
 #     the preview extension;
 #   * INSTALL EXTENSION vsql_vector                   — the SVECTOR + HNSW ext,
@@ -26,7 +33,6 @@ ROOT_DIR="${VB_ROOT_DIR:-/opt/villagesql}"
 DATA_DIR="${VB_DATA_DIR:-/var/lib/vbench/data}"
 SOCKET="${VB_SOCKET:-/var/run/vbench/villagesql.sock}"
 LOG_FILE="${VB_LOG_FILE:-/var/lib/vbench/villagesql.err}"
-INIT_SQL="${VB_INIT_SQL:-/opt/vbench/init.sql}"
 
 log() { printf '[vb-villagesql] %s\n' "$*" >&2; }
 
@@ -48,17 +54,32 @@ ensure_dirs() {
   mkdir -p "$DATA_DIR" "$(dirname "$SOCKET")" "$(dirname "$LOG_FILE")"
 }
 
-# Set to 1 by initialise() when it actually creates a fresh datadir; left 0 when
-# the datadir already existed. start_server() uses this to run --init-file ONLY
-# on first boot — INSTALL EXTENSION in init.sql is not idempotent and would abort
-# a restart (see init.sql), and it cannot be guarded in SQL (ER 1295 / no
-# DELIMITER under --init-file), so freshness is decided here instead.
+# Two-phase bootstrap, done ONCE when the datadir is created:
+#
+#   Phase 1: mysqld --initialize-insecure   — create the datadir. INSTALL
+#            EXTENSION cannot run here: the preview-capability framework
+#            (vsql::preview::storage) is not registered during --initialize, so
+#            the load fails "required capability not registered".
+#   Phase 2: a normal one-shot server start that runs, then shuts down:
+#              SET PERSIST vsql_allow_preview_extensions = ON;  -> mysqld-auto.cnf
+#              INSTALL EXTENSION vsql_vector;                   -> catalog
+#            Both are now DURABLE in the datadir. The extension is recorded in the
+#            catalog and auto-loads on every subsequent boot, and the preview gate
+#            is persisted so that auto-load is allowed — with no startup switch.
+#
+# The result: after bootstrap, an ordinary server start is a plain `exec mysqld`
+# with no --init-file, no --vsql_allow_preview_extensions switch, no post-start
+# install, and no background/retry — exactly MariaDB's clean lifecycle. That is
+# what removes the per-config restart race: the ann harness stops and restarts
+# the server on the same persisted datadir between configs, and a bare
+# `exec mysqld` has nothing extra to fail on.
 initialise() {
   if [[ -d "$DATA_DIR/mysql" ]]; then
     log "data directory already initialised at $DATA_DIR"
     return 0
   fi
-  log "initialising data directory at $DATA_DIR"
+
+  log "phase 1: initialising data directory at $DATA_DIR"
   "$MYSQLD" \
     --no-defaults \
     --initialize-insecure \
@@ -66,13 +87,69 @@ initialise() {
     --datadir="$DATA_DIR" \
     --log-error="$LOG_FILE" \
     $(user_args) >&2
-  log "initialisation complete"
+  log "phase 1 complete"
+
+  log "phase 2: one-shot start to persist preview gate + install vsql_vector"
+  local -a p2=(
+    --no-defaults
+    --basedir="$ROOT_DIR"
+    --datadir="$DATA_DIR"
+    --socket="$SOCKET"
+    --log-error="$LOG_FILE"
+    --pid-file=/var/run/vbench/villagesql.pid
+    --skip-name-resolve
+    --mysql-native-password=ON
+    # Needed for THIS phase-2 start only — it is what lets INSTALL EXTENSION
+    # run. We SET PERSIST it below so later boots do not need the switch.
+    --vsql_allow_preview_extensions=ON
+    --secure-file-priv=
+  )
+  local u; u="$(user_args)"; [[ -n "$u" ]] && p2+=( "$u" )
+  "$MYSQLD" "${p2[@]}" &
+  local p2_pid=$! _i
+  local client; client="$(find_bin mysql)"
+  for _i in $(seq 1 60); do
+    "$client" --no-defaults -uroot --socket="$SOCKET" -e "SELECT 1" >/dev/null 2>&1 && break
+    kill -0 "$p2_pid" 2>/dev/null || { log "FATAL: phase-2 server died during startup"; tail -20 "$LOG_FILE" >&2; exit 1; }
+    sleep 1
+  done
+  # Everything durable, done ONCE. All of it survives restarts (SET PERSIST ->
+  # mysqld-auto.cnf; user + extension -> catalog), so nothing here needs to re-run
+  # on a normal boot — which is what lets a normal boot be a plain exec mysqld.
+  # INSTALL is fatal here (unlike the old tolerant post-start install): a fresh
+  # datadir MUST get the extension, and a failure is a real bootstrap error.
+  #
+  #   * bench account — mysql_native_password, so the client stack matches
+  #     MariaDB/AliSQL and cannot skew the comparison.
+  #   * preview gate  — required before INSTALL and before every later auto-load.
+  #   * hypergraph optimizer — the classic optimizer never picks the custom KNN
+  #     scan (filesort over a full scan; can crash), so it is mandatory.
+  "$client" --no-defaults -uroot --socket="$SOCKET" -e "
+    CREATE USER IF NOT EXISTS 'bench'@'%'         IDENTIFIED WITH mysql_native_password BY 'bench';
+    GRANT ALL PRIVILEGES ON *.* TO 'bench'@'%'         WITH GRANT OPTION;
+    CREATE USER IF NOT EXISTS 'bench'@'localhost' IDENTIFIED WITH mysql_native_password BY 'bench';
+    GRANT ALL PRIVILEGES ON *.* TO 'bench'@'localhost' WITH GRANT OPTION;
+    SET PERSIST vsql_allow_preview_extensions = ON;
+    SET PERSIST optimizer_switch = 'hypergraph_optimizer=on';
+    INSTALL EXTENSION ${VB_EXTENSIONS:-vsql_vector};
+    FLUSH PRIVILEGES;
+  " || { log "FATAL: phase-2 bootstrap SQL failed"; tail -20 "$LOG_FILE" >&2; exit 1; }
+  log "phase 2: persisted gate + installed ${VB_EXTENSIONS:-vsql_vector}; shutting down"
+  "$client" --no-defaults -uroot --socket="$SOCKET" -e "SHUTDOWN" >/dev/null 2>&1 || true
+  wait "$p2_pid" 2>/dev/null || true
+  log "phase 2 complete — datadir is bootstrapped; subsequent starts are plain mysqld"
 }
 
 start_server() {
   ensure_dirs
-  initialise
+  initialise   # two-phase bootstrap on first boot; no-op on a persisted datadir
 
+  # After bootstrap the datadir already has the preview gate persisted and the
+  # extension recorded in the catalog, so a normal start is a bare `exec mysqld`
+  # — no --init-file, no --vsql_allow_preview_extensions switch, no post-start
+  # install, no background/retry. This is deliberately MariaDB's clean lifecycle:
+  # the ann harness restarts the server per config on the same persisted datadir,
+  # and a plain exec has nothing extra that can lose the InnoDB-lock teardown race.
   local -a args=(
     --no-defaults
     --basedir="$ROOT_DIR"
@@ -81,35 +158,17 @@ start_server() {
     --log-error="$LOG_FILE"
     --pid-file=/var/run/vbench/villagesql.pid
     --skip-name-resolve
-    # MySQL 8.4 ships mysql_native_password DISABLED. init.sql creates the bench
-    # account IDENTIFIED WITH mysql_native_password, which fails ("Plugin not
-    # loaded") — and, run from --init-file, aborts startup — unless the plugin is
-    # enabled here. The harness also passes this via VB_SERVER_ARGS, but hard-code
-    # it too so a by-hand `docker run ... server` starts a usable server as well.
+    # MySQL 8.4 ships mysql_native_password DISABLED; the bench account uses it,
+    # so keep it enabled on every boot. Cheap and idempotent.
     --mysql-native-password=ON
-    # The preview gate must be ON *before* the server auto-loads the persisted
-    # vsql_vector extension. init.sql SET-PERSISTs it, but on a RESTART the
-    # persisted extension is auto-loaded from the catalog and the parse-early
-    # var from mysqld-auto.cnf is not reliably applied first (and --no-defaults
-    # complicates option-file handling) — so a restart aborted with "requires
-    # preview capabilities but vsql_allow_preview_extensions is OFF". Passing it
-    # as an explicit startup arg guarantees it is set before extension load on
-    # EVERY boot, fresh or restart, independent of PERSIST timing.
+    # Harmless if the persisted gate already covers auto-load; kept as a belt-and
+    # -braces guarantee that the gate is ON before the catalog extension loads,
+    # independent of mysqld-auto.cnf parse-order. It is NOT what makes install
+    # work anymore (that is done once in phase 2) — remove if the gate proves
+    # sufficient on its own.
     --vsql_allow_preview_extensions=ON
-    # The extension loads vectors from text literals; secure_file_priv is not
-    # used by the harness but a stray non-empty default can block server-side
-    # file ops during init, so pin it empty (matches the reference harness).
     --secure-file-priv=
   )
-  # init.sql runs on EVERY boot via --init-file. It contains only idempotent
-  # statements (CREATE USER IF NOT EXISTS, SET PERSIST gates) — safe to re-run on
-  # a persisted datadir. The extension INSTALL is deliberately NOT in init.sql:
-  # it is not idempotent, cannot be IF-guarded in --init-file (no conditional
-  # DDL / DELIMITER; INSTALL is not preparable — ER 1295), and --init-file aborts
-  # startup on any error. Instead it is done AFTER the server is up, tolerantly
-  # (below), so a re-run that hits "already installed" is a harmless no-op —
-  # matching how the MySQL-family and the native start_server.sh handle it.
-  [[ -f "$INIT_SQL" ]] && args+=( --init-file="$INIT_SQL" )
   # --no-defaults must be first; strip any duplicate from VB_SERVER_ARGS.
   if [[ -n "${VB_SERVER_ARGS:-}" ]]; then
     for _arg in ${VB_SERVER_ARGS}; do
@@ -120,59 +179,10 @@ start_server() {
   args+=( "$@" )
   local u; u="$(user_args)"; [[ -n "$u" ]] && args+=( "$u" )
 
-  # Run mysqld in the BACKGROUND so we can install the extension once it is up,
-  # then hand the container's foreground to it via `wait` (so it stays effectively
-  # PID 1 and receives signals). exec-ing mysqld directly would leave no point at
-  # which to run the post-start install.
-  #
-  # RESTART RACE: the ann harness restarts the server per config (SHUTDOWN, then a
-  # fresh entrypoint on the SAME datadir). A previous mysqld can still be releasing
-  # its InnoDB file locks (dblwr / ibdata) when the new one starts, so the new one
-  # dies with "Unable to lock ./#ib_16384_0.dblwr error: 11" (EAGAIN) and the ann
-  # run reports "server exited during startup with code 1". The old server frees
-  # the locks within ~1s, so retry the launch a few times before giving up.
-  local mysqld_pid ready=0 _i attempt
-  for attempt in 1 2 3 4 5; do
-    log "starting (attempt $attempt) $MYSQLD ${args[*]}"
-    "$MYSQLD" "${args[@]}" &
-    mysqld_pid=$!
-    ready=0
-    for _i in $(seq 1 60); do
-      if "$(find_bin mysql)" --no-defaults -uroot --socket="$SOCKET" \
-           -e "SELECT 1" >/dev/null 2>&1; then ready=1; break; fi
-      # mysqld died during startup — stop waiting; retry if a lock race, else fail.
-      kill -0 "$mysqld_pid" 2>/dev/null || break
-      sleep 1
-    done
-    [[ "$ready" == "1" ]] && break
-    # Not ready: if mysqld exited on the transient InnoDB lock error, wait for the
-    # old server to finish releasing and retry. Any other exit is a real failure.
-    wait "$mysqld_pid" 2>/dev/null || true
-    # Look only at the tail so a lock error from an earlier attempt does not
-    # trigger a spurious retry.
-    if tail -5 "$LOG_FILE" 2>/dev/null | grep -q "Unable to lock .*error: 11" \
-       && [[ "$attempt" -lt 5 ]]; then
-      log "startup lost the InnoDB lock race (old server still exiting); retrying in 2s"
-      sleep 2
-      continue
-    fi
-    break
-  done
-  if [[ "$ready" == "1" ]]; then
-    for ext in ${VB_EXTENSIONS:-vsql_vector}; do
-      if "$(find_bin mysql)" --no-defaults -uroot --socket="$SOCKET" \
-           -e "INSTALL EXTENSION $ext" >/dev/null 2>&1; then
-        log "installed extension $ext"
-      else
-        log "extension $ext already installed (or install skipped) — continuing"
-      fi
-    done
-  else
-    log "WARNING: server did not become ready; skipping extension install"
-  fi
-
-  # Hand foreground to mysqld: the container lives and dies with it.
-  wait "$mysqld_pid"
+  # exec: the container lives and dies with mysqld, which becomes PID 1 and gets
+  # signals directly — no wrapper process to forward them or race on teardown.
+  log "starting $MYSQLD (plain exec) ${args[*]}"
+  exec "$MYSQLD" "${args[@]}"
 }
 
 cmd="${1:-server}"; shift || true

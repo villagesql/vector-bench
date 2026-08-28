@@ -1,4 +1,4 @@
-#
+ #
 # VillageSQL (MySQL 8.4.10 base) + the vsql_vector extension (SVECTOR type and
 # HNSW custom index), both built from pinned branches.
 #
@@ -150,14 +150,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /opt/villagesql /opt/villagesql
 COPY entrypoint-villagesql.sh /usr/local/bin/vb-entrypoint
-COPY init.sql /opt/vbench/init.sql
+# No init.sql: the datadir is bootstrapped once by the entrypoint's two-phase
+# init (create bench user, PERSIST gates, INSTALL vsql_vector), so normal boots
+# are a plain `exec mysqld` with no --init-file.
 RUN chmod +x /usr/local/bin/vb-entrypoint \
     && mkdir -p "${VB_DATA_DIR}" /var/run/vbench \
-    && chown -R mysql:mysql /var/lib/vbench /var/run/vbench \
-    && chmod 0644 /opt/vbench/init.sql
+    && chown -R mysql:mysql /var/lib/vbench /var/run/vbench
 
-ENV VB_INIT_SQL=/opt/vbench/init.sql \
-    VB_DB_USER=bench \
+ENV VB_DB_USER=bench \
     VB_DB_PASSWORD=bench
 
 EXPOSE 3306

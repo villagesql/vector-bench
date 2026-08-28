@@ -393,6 +393,12 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             "VB_MONGOT_HEAP_GB": str(
                 max(1, resolved.mongot_heap_bytes // (1024 ** 3))),
             "VB_MAXMEMORY_BYTES": str(resolved.maxmemory_bytes),
+            # Durable path (bind-mounted under /home/app) for the engine entrypoint
+            # to dump its server error log on a failed start. The ann harness tears
+            # the container down after a start failure, so the in-container error
+            # log is otherwise lost; this preserves it on the host for diagnosis of
+            # intermittent restart failures.
+            "VB_STARTUP_ERR_DUMP": "/home/app/results/startup-err.log",
             "PYTHONUNBUFFERED": "1",
         },
         volumes=[
