@@ -27,3 +27,12 @@ SET PERSIST optimizer_switch = 'hypergraph_optimizer=on';
 INSTALL EXTENSION vsql_vector;
 
 FLUSH PRIVILEGES;
+
+-- Shut the bootstrap server down from within the init-file itself. mysqld runs
+-- this init-file to completion before it accepts any connection, so with
+-- SHUTDOWN here the phase-2 process applies everything above and then exits on
+-- its own — no background process, no socket polling, no window in which a
+-- client could connect to a server that has not finished installing the
+-- extension. The entrypoint runs phase 2 in the FOREGROUND and its exit code is
+-- the bootstrap result.
+SHUTDOWN;

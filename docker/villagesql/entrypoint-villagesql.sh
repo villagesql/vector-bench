@@ -11,14 +11,15 @@
 # `mysqld --initialize-insecure` (like AliSQL, unlike MariaDB).
 #
 # The datadir is bootstrapped ONCE, in two phases (see initialise()): phase 1
-# --initialize, phase 2 a --skip-networking --init-file start that PERSISTs the
-# preview gate + the hypergraph optimizer, creates the bench account, and
-# INSTALLs vsql_vector — all durable in the datadir. --skip-networking means no
-# client can connect while the extension is being installed (a client that
-# connected mid-bootstrap would see no SVECTOR type and fail). After that a
-# normal start is a plain `exec mysqld`: no --init-file, no preview switch, no
-# post-start install. This matches MariaDB's lifecycle and is what makes the ann
-# harness's per-config restart race-free.
+# --initialize, phase 2 a FOREGROUND --skip-networking --init-file start whose
+# init-file PERSISTs the preview gate + the hypergraph optimizer, creates the
+# bench account, INSTALLs vsql_vector, and ends with SHUTDOWN — so it applies
+# everything and exits on its own. Because mysqld runs the init-file before it
+# accepts connections and networking is off, no client can ever connect to a
+# half-bootstrapped server (one that would show no SVECTOR type and fail). All
+# of it is durable in the datadir, so a normal start is a plain `exec mysqld`:
+# no --init-file, no preview switch, no post-start install. This matches
+# MariaDB's lifecycle and makes the ann harness's per-config restart race-free.
 #
 # vsql_vector specifics (all set up in phase 2):
 #   * SET PERSIST vsql_allow_preview_extensions = ON  — required to install/use
@@ -93,30 +94,33 @@ initialise() {
     $(user_args) >&2
   log "phase 1 complete"
 
-  log "phase 2: --skip-networking --init-file bootstrap (persist gate + install vsql_vector)"
+  log "phase 2: --init-file bootstrap (persist gate + install vsql_vector)"
   # Phase 2 runs the durable bootstrap (create bench user, PERSIST the preview
-  # gate + hypergraph optimizer, INSTALL EXTENSION) via --init-file, on a start
-  # with --skip-networking so NOTHING external can connect while it runs.
+  # gate + hypergraph optimizer, INSTALL EXTENSION) via --init-file, on a
+  # FOREGROUND, --skip-networking start. It is self-terminating: bootstrap.sql
+  # ends with SHUTDOWN, and mysqld runs the whole init-file to completion BEFORE
+  # it accepts any connection — so this mysqld applies everything and then exits
+  # on its own. No background process, no socket polling, no window in which a
+  # client could connect to a server that has not finished installing the
+  # extension.
   #
-  # This isolation is the whole point. If phase 2 were reachable on the public
-  # socket/port, a client that polls "is the server up?" (the ann harness does
-  # exactly this) would connect the instant phase 2 answers — BEFORE INSTALL
-  # EXTENSION has run — see no SVECTOR type, and its CREATE TABLE/INDEX would
-  # fail ("Expected a type ... SVECTOR" / "Custom type operation failed"). It is
-  # an intermittent race: connect after the install and it works, during it and
-  # it fails. --skip-networking (no TCP) plus a PRIVATE socket means the only
-  # server a client can ever reach is the FINAL one, which already has the
-  # extension. --init-file also aborts startup on any error, so a bad bootstrap
-  # fails loudly instead of leaving a half-initialised datadir.
+  # Why this isolation matters: if a half-bootstrapped server were reachable, a
+  # client that polls "is the server up?" (the ann harness does exactly this)
+  # would connect the instant it answered — BEFORE INSTALL EXTENSION ran — see
+  # no SVECTOR type, and its CREATE TABLE/INDEX would fail ("Expected a type ...
+  # SVECTOR" / "Custom type operation failed"). Here there is simply no such
+  # server: the only mysqld a client can ever reach is the FINAL one, started
+  # after phase 2 has exited, which already has the extension. --init-file also
+  # aborts startup on any error, so a bad bootstrap exits non-zero and we fail
+  # loudly instead of leaving a half-initialised datadir.
   #
   # All of it is DURABLE (SET PERSIST -> mysqld-auto.cnf; user + extension ->
   # catalog), so an ordinary boot is a plain exec mysqld with no --init-file.
-  local p2_socket="/var/run/vbench/bootstrap.sock"
   local -a p2=(
     --no-defaults
     --basedir="$ROOT_DIR"
     --datadir="$DATA_DIR"
-    --socket="$p2_socket"
+    --socket=/var/run/vbench/bootstrap.sock
     --skip-networking
     --log-error="$LOG_FILE"
     --pid-file=/var/run/vbench/bootstrap.pid
@@ -129,23 +133,12 @@ initialise() {
     --init-file="$BOOTSTRAP_SQL"
   )
   local u; u="$(user_args)"; [[ -n "$u" ]] && p2+=( "$u" )
-  "$MYSQLD" "${p2[@]}" &
-  local p2_pid=$! _i client
-  client="$(find_bin mysql)"
-  # Wait until the private socket answers — that only happens AFTER --init-file
-  # has fully applied (INSTALL included), because mysqld runs the init-file
-  # before it starts accepting connections. So a successful SELECT 1 here means
-  # the bootstrap is done.
-  local ok=0
-  for _i in $(seq 1 90); do
-    "$client" --no-defaults -uroot --socket="$p2_socket" -e "SELECT 1" >/dev/null 2>&1 && { ok=1; break; }
-    kill -0 "$p2_pid" 2>/dev/null || { log "FATAL: phase-2 bootstrap start failed (--init-file aborts on error)"; tail -30 "$LOG_FILE" >&2; exit 1; }
-    sleep 1
-  done
-  [[ "$ok" == "1" ]] || { log "FATAL: phase-2 bootstrap did not become ready"; tail -30 "$LOG_FILE" >&2; exit 1; }
-  log "phase 2: bootstrap applied; shutting down the private server"
-  "$client" --no-defaults -uroot --socket="$p2_socket" -e "SHUTDOWN" >/dev/null 2>&1 || true
-  wait "$p2_pid" 2>/dev/null || true
+  # Foreground: mysqld applies the init-file (ending in SHUTDOWN) and exits. Its
+  # exit code IS the bootstrap result — non-zero means the init-file hit an
+  # error (INSTALL failed, etc.), which is fatal.
+  if ! "$MYSQLD" "${p2[@]}"; then
+    log "FATAL: phase-2 bootstrap failed (--init-file error)"; tail -30 "$LOG_FILE" >&2; exit 1
+  fi
   log "phase 2 complete — datadir is bootstrapped; subsequent starts are plain mysqld"
 }
 
