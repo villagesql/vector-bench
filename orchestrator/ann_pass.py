@@ -356,8 +356,21 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     # Each configuration builds a fresh index, so the directory is cleared
     # rather than reused; leaving it would also make the ingest measurement
     # depend on whatever the previous run left behind.
+    #
+    # The datadir is ROOT-OWNED: the engine (mysqld --user=root, initdb, etc.)
+    # writes it from inside the container, so the files are owned by uid 0 on the
+    # host. A plain shutil.rmtree runs as the host user and CANNOT delete them;
+    # with ignore_errors=True it fails SILENTLY, leaving the previous run's whole
+    # datadir in place. That stale datadir is a real correctness bug, not just
+    # wasted disk: e.g. a datadir created by an OLDER server build (say 0.0.6-dev)
+    # survives into a run with a NEWER binary (0.0.7-dev), and VillageSQL's
+    # data-dictionary upgrade guard then aborts startup ("Upgrading from a
+    # development version is not allowed") — the server never even comes up.
+    # Delete through a root container, exactly as the ops pass does.
     state_dir = os.path.join(paths["engine_state"], "annb", f"{resource_pass}-{engine}")
-    shutil.rmtree(state_dir, ignore_errors=True)
+    if not docker_ctl.remove_tree_as_root(state_dir, image):
+        print(f"[ann] WARNING: {state_dir} survived teardown (still root-owned); "
+              f"a stale datadir here can break the next run", file=sys.stderr)
     os.makedirs(state_dir, exist_ok=True)
 
     command = [
