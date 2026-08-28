@@ -11,11 +11,14 @@
 # `mysqld --initialize-insecure` (like AliSQL, unlike MariaDB).
 #
 # The datadir is bootstrapped ONCE, in two phases (see initialise()): phase 1
-# --initialize, phase 2 a one-shot start that PERSISTs the preview gate + the
-# hypergraph optimizer, creates the bench account, and INSTALLs vsql_vector — all
-# durable in the datadir. After that a normal start is a plain `exec mysqld`: no
-# --init-file, no preview switch, no post-start install. This matches MariaDB's
-# lifecycle and is what makes the ann harness's per-config restart race-free.
+# --initialize, phase 2 a --skip-networking --init-file start that PERSISTs the
+# preview gate + the hypergraph optimizer, creates the bench account, and
+# INSTALLs vsql_vector — all durable in the datadir. --skip-networking means no
+# client can connect while the extension is being installed (a client that
+# connected mid-bootstrap would see no SVECTOR type and fail). After that a
+# normal start is a plain `exec mysqld`: no --init-file, no preview switch, no
+# post-start install. This matches MariaDB's lifecycle and is what makes the ann
+# harness's per-config restart race-free.
 #
 # vsql_vector specifics (all set up in phase 2):
 #   * SET PERSIST vsql_allow_preview_extensions = ON  — required to install/use
@@ -33,6 +36,7 @@ ROOT_DIR="${VB_ROOT_DIR:-/opt/villagesql}"
 DATA_DIR="${VB_DATA_DIR:-/var/lib/vbench/data}"
 SOCKET="${VB_SOCKET:-/var/run/vbench/villagesql.sock}"
 LOG_FILE="${VB_LOG_FILE:-/var/lib/vbench/villagesql.err}"
+BOOTSTRAP_SQL="${VB_BOOTSTRAP_SQL:-/opt/vbench/bootstrap.sql}"
 
 log() { printf '[vb-villagesql] %s\n' "$*" >&2; }
 
@@ -89,53 +93,58 @@ initialise() {
     $(user_args) >&2
   log "phase 1 complete"
 
-  log "phase 2: one-shot start to persist preview gate + install vsql_vector"
+  log "phase 2: --skip-networking --init-file bootstrap (persist gate + install vsql_vector)"
+  # Phase 2 runs the durable bootstrap (create bench user, PERSIST the preview
+  # gate + hypergraph optimizer, INSTALL EXTENSION) via --init-file, on a start
+  # with --skip-networking so NOTHING external can connect while it runs.
+  #
+  # This isolation is the whole point. If phase 2 were reachable on the public
+  # socket/port, a client that polls "is the server up?" (the ann harness does
+  # exactly this) would connect the instant phase 2 answers — BEFORE INSTALL
+  # EXTENSION has run — see no SVECTOR type, and its CREATE TABLE/INDEX would
+  # fail ("Expected a type ... SVECTOR" / "Custom type operation failed"). It is
+  # an intermittent race: connect after the install and it works, during it and
+  # it fails. --skip-networking (no TCP) plus a PRIVATE socket means the only
+  # server a client can ever reach is the FINAL one, which already has the
+  # extension. --init-file also aborts startup on any error, so a bad bootstrap
+  # fails loudly instead of leaving a half-initialised datadir.
+  #
+  # All of it is DURABLE (SET PERSIST -> mysqld-auto.cnf; user + extension ->
+  # catalog), so an ordinary boot is a plain exec mysqld with no --init-file.
+  local p2_socket="/var/run/vbench/bootstrap.sock"
   local -a p2=(
     --no-defaults
     --basedir="$ROOT_DIR"
     --datadir="$DATA_DIR"
-    --socket="$SOCKET"
+    --socket="$p2_socket"
+    --skip-networking
     --log-error="$LOG_FILE"
-    --pid-file=/var/run/vbench/villagesql.pid
+    --pid-file=/var/run/vbench/bootstrap.pid
     --skip-name-resolve
     --mysql-native-password=ON
-    # Needed for THIS phase-2 start only — it is what lets INSTALL EXTENSION
-    # run. We SET PERSIST it below so later boots do not need the switch.
+    # Lets INSTALL EXTENSION run during this bootstrap start; the init-file
+    # SET-PERSISTs the gate so later boots need no switch.
     --vsql_allow_preview_extensions=ON
     --secure-file-priv=
+    --init-file="$BOOTSTRAP_SQL"
   )
   local u; u="$(user_args)"; [[ -n "$u" ]] && p2+=( "$u" )
   "$MYSQLD" "${p2[@]}" &
-  local p2_pid=$! _i
-  local client; client="$(find_bin mysql)"
-  for _i in $(seq 1 60); do
-    "$client" --no-defaults -uroot --socket="$SOCKET" -e "SELECT 1" >/dev/null 2>&1 && break
-    kill -0 "$p2_pid" 2>/dev/null || { log "FATAL: phase-2 server died during startup"; tail -20 "$LOG_FILE" >&2; exit 1; }
+  local p2_pid=$! _i client
+  client="$(find_bin mysql)"
+  # Wait until the private socket answers — that only happens AFTER --init-file
+  # has fully applied (INSTALL included), because mysqld runs the init-file
+  # before it starts accepting connections. So a successful SELECT 1 here means
+  # the bootstrap is done.
+  local ok=0
+  for _i in $(seq 1 90); do
+    "$client" --no-defaults -uroot --socket="$p2_socket" -e "SELECT 1" >/dev/null 2>&1 && { ok=1; break; }
+    kill -0 "$p2_pid" 2>/dev/null || { log "FATAL: phase-2 bootstrap start failed (--init-file aborts on error)"; tail -30 "$LOG_FILE" >&2; exit 1; }
     sleep 1
   done
-  # Everything durable, done ONCE. All of it survives restarts (SET PERSIST ->
-  # mysqld-auto.cnf; user + extension -> catalog), so nothing here needs to re-run
-  # on a normal boot — which is what lets a normal boot be a plain exec mysqld.
-  # INSTALL is fatal here (unlike the old tolerant post-start install): a fresh
-  # datadir MUST get the extension, and a failure is a real bootstrap error.
-  #
-  #   * bench account — mysql_native_password, so the client stack matches
-  #     MariaDB/AliSQL and cannot skew the comparison.
-  #   * preview gate  — required before INSTALL and before every later auto-load.
-  #   * hypergraph optimizer — the classic optimizer never picks the custom KNN
-  #     scan (filesort over a full scan; can crash), so it is mandatory.
-  "$client" --no-defaults -uroot --socket="$SOCKET" -e "
-    CREATE USER IF NOT EXISTS 'bench'@'%'         IDENTIFIED WITH mysql_native_password BY 'bench';
-    GRANT ALL PRIVILEGES ON *.* TO 'bench'@'%'         WITH GRANT OPTION;
-    CREATE USER IF NOT EXISTS 'bench'@'localhost' IDENTIFIED WITH mysql_native_password BY 'bench';
-    GRANT ALL PRIVILEGES ON *.* TO 'bench'@'localhost' WITH GRANT OPTION;
-    SET PERSIST vsql_allow_preview_extensions = ON;
-    SET PERSIST optimizer_switch = 'hypergraph_optimizer=on';
-    INSTALL EXTENSION ${VB_EXTENSIONS:-vsql_vector};
-    FLUSH PRIVILEGES;
-  " || { log "FATAL: phase-2 bootstrap SQL failed"; tail -20 "$LOG_FILE" >&2; exit 1; }
-  log "phase 2: persisted gate + installed ${VB_EXTENSIONS:-vsql_vector}; shutting down"
-  "$client" --no-defaults -uroot --socket="$SOCKET" -e "SHUTDOWN" >/dev/null 2>&1 || true
+  [[ "$ok" == "1" ]] || { log "FATAL: phase-2 bootstrap did not become ready"; tail -30 "$LOG_FILE" >&2; exit 1; }
+  log "phase 2: bootstrap applied; shutting down the private server"
+  "$client" --no-defaults -uroot --socket="$p2_socket" -e "SHUTDOWN" >/dev/null 2>&1 || true
   wait "$p2_pid" 2>/dev/null || true
   log "phase 2 complete — datadir is bootstrapped; subsequent starts are plain mysqld"
 }

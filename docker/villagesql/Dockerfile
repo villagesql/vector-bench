@@ -150,12 +150,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /opt/villagesql /opt/villagesql
 COPY entrypoint-villagesql.sh /usr/local/bin/vb-entrypoint
-# No init.sql: the datadir is bootstrapped once by the entrypoint's two-phase
-# init (create bench user, PERSIST gates, INSTALL vsql_vector), so normal boots
-# are a plain `exec mysqld` with no --init-file.
+# bootstrap.sql runs ONCE via --init-file during the entrypoint's phase-2
+# (--skip-networking) bootstrap: create bench user, PERSIST gates, INSTALL
+# vsql_vector. It is NOT used on ordinary boots — those are a plain `exec
+# mysqld` with no --init-file.
+COPY bootstrap.sql /opt/vbench/bootstrap.sql
 RUN chmod +x /usr/local/bin/vb-entrypoint \
     && mkdir -p "${VB_DATA_DIR}" /var/run/vbench \
-    && chown -R mysql:mysql /var/lib/vbench /var/run/vbench
+    && chown -R mysql:mysql /var/lib/vbench /var/run/vbench \
+    && chmod 0644 /opt/vbench/bootstrap.sql
 
 ENV VB_DB_USER=bench \
     VB_DB_PASSWORD=bench
