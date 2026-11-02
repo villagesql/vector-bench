@@ -382,7 +382,9 @@ class TestFilteredDeclined:
     def test_no_other_driver_declines_anything(self):
         from harness.drivers.postgres import _driver_classes
         for name, cls in _driver_classes().items():
-            if name != "MyVectorDriver":
+            # VillageSQL declines filtered and churn; its own tests
+            # (test_e28) pin that.
+            if name not in ("MyVectorDriver", "VillageSQLDriver"):
                 assert tuple(cls.declined_workloads) == (), name
 
     def test_config_capability_agrees(self):

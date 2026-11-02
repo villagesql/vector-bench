@@ -275,6 +275,99 @@ prepare_pgvector() {
   stage_context pgvector "$tar"
 }
 
+
+# ---------------------------------------------------------------------------
+# VillageSQL -- two trees: the server, and the vsql_vector extension that is
+# compiled against the server's build tree.
+#
+# Each is fetched BY ITS PINNED COMMIT, as myvector's plugin is, and the
+# resolved commit is checked against the pin. The branches in the config are
+# where those commits were published and are recorded for provenance; nothing
+# here follows them, so a push to either branch cannot change what is built.
+#
+# Two tarballs rather than one concatenated source.tar (`source.tarballs` in
+# the config, read by build-images.sh): the Dockerfile COPYs them as separate
+# layers, the server's before its ~30 min compile and the extension's after
+# it, so a new extension commit rebuilds in minutes instead of recompiling the
+# server.
+# ---------------------------------------------------------------------------
+
+# _fetch_pinned <label> <dir> <upstream> <sha> -- fetch one commit, shallow.
+_fetch_pinned() {
+  local label="$1" repo="$2" upstream="$3" sha="$4"
+  if [[ ! -d "$repo/.git" ]]; then
+    git init --quiet "$repo"
+    git -C "$repo" remote add origin "$upstream"
+  fi
+  git -C "$repo" cat-file -e "${sha}^{commit}" 2>/dev/null \
+    || git -C "$repo" fetch --quiet --depth 1 origin "$sha" \
+    || die "villagesql: cannot fetch $label commit $sha from $upstream"
+  local resolved; resolved="$(git -C "$repo" rev-parse "${sha}^{commit}")"
+  [[ "$resolved" == "$sha" ]] \
+    || die "villagesql: $label commit $sha resolved to $resolved -- not the pinned commit"
+}
+
+prepare_villagesql() {
+  local cfg="$VB_CONFIG/engines/villagesql.yml"
+  local tag; tag="$(yq_get "$cfg" source.tag "")"
+  [[ -n "$tag" ]] || die "villagesql: $cfg has no source.tag"
+  local srv_up;  srv_up="$(yq_get "$cfg" source.server_upstream "")"
+  local srv_sha; srv_sha="$(yq_get "$cfg" source.server_commit "")"
+  local ext_up;  ext_up="$(yq_get "$cfg" source.extension_upstream "")"
+  local ext_sha; ext_sha="$(yq_get "$cfg" source.extension_commit "")"
+  [[ -n "$srv_up" && -n "$srv_sha" ]] \
+    || die "villagesql: $cfg needs source.server_upstream and source.server_commit"
+  [[ -n "$ext_up" && -n "$ext_sha" ]] \
+    || die "villagesql: $cfg needs source.extension_upstream and source.extension_commit"
+
+  local srv_repo="$VB_SOURCES/villagesql-server-git"
+  local ext_repo="$VB_SOURCES/vsql-vector-pk-git"
+  info "villagesql: server ${srv_sha:0:12}, extension ${ext_sha:0:12}"
+  _fetch_pinned server "$srv_repo" "$srv_up" "$srv_sha"
+  _fetch_pinned extension "$ext_repo" "$ext_up" "$ext_sha"
+
+  # Named by commit, so a re-pin of either tree is a different file and an
+  # existing tarball is current by construction.
+  local srv_tar="$VB_SOURCES/villagesql-server-${srv_sha}.tar"
+  local ext_tar="$VB_SOURCES/villagesql-extension-${ext_sha}.tar"
+  if [[ $FORCE -eq 1 || ! -f "$srv_tar" ]]; then
+    git -C "$srv_repo" archive --format=tar --prefix=source/ "$srv_sha" > "$srv_tar.tmp"
+    mv "$srv_tar.tmp" "$srv_tar"
+  fi
+  if [[ $FORCE -eq 1 || ! -f "$ext_tar" ]]; then
+    git -C "$ext_repo" archive --format=tar --prefix=extension/ "$ext_sha" > "$ext_tar.tmp"
+    mv "$ext_tar.tmp" "$ext_tar"
+  fi
+
+  python3 - "$VB_SOURCES/villagesql.source.json" "$tag" \
+           "$srv_sha" "$srv_up" "$(yq_get "$cfg" source.server_branch "")" \
+           "$ext_sha" "$ext_up" "$(yq_get "$cfg" source.extension_branch "")" <<'PY'
+import json, sys
+out, tag, srv, srv_up, srv_br, ext, ext_up, ext_br = sys.argv[1:9]
+with open(out, "w") as fh:
+    json.dump({"engine": "villagesql", "tag": tag,
+               "server_commit": srv, "server_origin": srv_up,
+               "server_branch": srv_br,
+               "extension_commit": ext, "extension_origin": ext_up,
+               "extension_branch": ext_br},
+              fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+  ok "villagesql: server=${srv_sha:0:12} extension=${ext_sha:0:12} tag=$tag"
+
+  # stage_context's file handling, for two tarballs instead of one.
+  local ctx="$VB_BUILDCTX/villagesql"
+  mkdir -p "$ctx"
+  rm -f "$ctx/server.tar" "$ctx/extension.tar"
+  ln "$srv_tar" "$ctx/server.tar"    2>/dev/null || cp "$srv_tar" "$ctx/server.tar"
+  ln "$ext_tar" "$ctx/extension.tar" 2>/dev/null || cp "$ext_tar" "$ctx/extension.tar"
+  find "$VB_DOCKER/_shared" -maxdepth 1 -type f \
+       -exec cp {} "$ctx/" \; 2>/dev/null || true
+  find "$VB_DOCKER/villagesql" -maxdepth 1 -type f ! -name 'Dockerfile' \
+       -exec cp {} "$ctx/" \; 2>/dev/null || true
+  ok "villagesql: build context ready at $ctx (server.tar + extension.tar)"
+}
+
 # ---------------------------------------------------------------------------
 # Build context staging
 # ---------------------------------------------------------------------------
@@ -456,13 +549,14 @@ case "$ENGINE" in
   all)        prepare_mariadb mariadb; prepare_alisql; prepare_pgvector ;;
   percona)    prepare_percona ;;
   myvector)   prepare_myvector ;;
+  villagesql) prepare_villagesql ;;
   mariadb)    prepare_mariadb mariadb ;;
   mariadb123) prepare_mariadb mariadb123 ;;
   alisql)     prepare_alisql ;;
   pgvector)   prepare_pgvector ;;
   mongodb)    prepare_mongodb ;;
   valkey)     prepare_valkey ;;
-  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|valkey|percona|myvector|all)" ;;
+  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|valkey|percona|myvector|villagesql|all)" ;;
 esac
 
 ok "sources prepared"

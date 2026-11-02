@@ -1424,7 +1424,10 @@ class TestBuildContextCompleteness:
             assert os.path.isfile(dockerfile), f"{engine}: no Dockerfile at {dockerfile}"
             available = set(os.listdir(os.path.join(docker_dir, base)))
             available |= set(os.listdir(os.path.join(docker_dir, "_shared")))
-            available.add("source.tar")          # produced by prepare-sources
+            # Produced by prepare-sources: one source.tar, or the
+            # tarballs an engine declares under `source.tarballs`.
+            available.update((cfg.get("source") or {}).get("tarballs")
+                             or ["source.tar"])
             for src in self._copy_sources(dockerfile):
                 assert src in available, (
                     f"{engine}: Dockerfile COPYs {src!r}, which is in neither "
@@ -5048,7 +5051,7 @@ class TestARunMeasuresEveryEngineByDefault:
         from orchestrator.cli import KNOWN_ENGINES
         assert set(KNOWN_ENGINES) == {"mariadb", "mariadb123", "alisql",
                                       "pgvector", "valkey", "mongodb",
-                                      "percona", "myvector"}
+                                      "percona", "myvector", "villagesql"}
 
     def test_run_defaults_to_all_of_them(self):
         source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
@@ -5212,7 +5215,7 @@ class TestAProfileThatNamesItsEnginesGetsThem:
         true and would stay green while proving nothing."""
         from orchestrator.cli import KNOWN_ENGINES
         assert load_profile("percona")["engines"] == ["percona"]
-        assert len(KNOWN_ENGINES) == 8
+        assert len(KNOWN_ENGINES) == 9
         assert "engines" not in load_profile("smoke")
 
     def test_a_bare_run_of_a_one_engine_profile_runs_one_engine(

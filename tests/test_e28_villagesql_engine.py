@@ -178,3 +178,62 @@ class TestAnnModule:
         # set it or they search at the default width.
         worker = source.split("def worker")[1].split("chunks =")[0]
         assert "self.dialect.set_ef_search" in worker
+
+
+def _read(rel: str) -> str:
+    with open(os.path.join(VB_ROOT, rel)) as fh:
+        return fh.read()
+
+
+def _config() -> dict:
+    import yaml
+    return yaml.safe_load(_read("config/engines/villagesql.yml"))
+
+
+class TestWiring:
+    def test_both_trees_are_pinned_by_commit(self):
+        """Branches float; a run built from one is unreproducible."""
+        source = _config()["source"]
+        for key in ("server_commit", "extension_commit"):
+            assert len(source[key]) == 40, key
+        assert "server_commit" in _read("scripts/prepare-sources.sh")
+
+    def test_the_driver_is_registered_by_class_name(self):
+        from harness.drivers.postgres import _driver_classes, _driver_table
+        assert _driver_classes()["VillageSQLDriver"] is vs.VillageSQLDriver
+        assert _driver_table()["villagesql"] is vs.VillageSQLDriver
+        assert _config()["runtime"]["driver"] == "VillageSQLDriver"
+
+    def test_the_error_log_is_where_the_entrypoint_writes_it(self):
+        """Otherwise the ops path copies out nothing when the server dies."""
+        log = _config()["runtime"]["error_log"]
+        assert f'LOG_FILE="${{VB_LOG_FILE:-{log}}}"' in _read(
+            "docker/villagesql/entrypoint-villagesql.sh")
+
+    def test_the_image_records_its_march(self):
+        assert "/opt/villagesql/.march" in _read("docker/villagesql/Dockerfile")
+
+    def test_the_build_context_names_both_tarballs(self):
+        assert _config()["source"]["tarballs"] == ["server.tar", "extension.tar"]
+        dockerfile = _read("docker/villagesql/Dockerfile")
+        assert "COPY server.tar" in dockerfile
+        assert "COPY extension.tar" in dockerfile
+
+    def test_the_graph_share_goes_to_the_buffer_pool(self):
+        """The graph is InnoDB pages, cached nowhere but the buffer pool."""
+        from orchestrator.config import load_resources, resolve_resources
+        from harness.metrics import sysinfo
+        info = sysinfo.collect()
+        resources = load_resources("normalized")
+        vsql = resolve_resources(resources, "villagesql", info)
+        mariadb = resolve_resources(resources, "mariadb", info)
+        assert vsql.graph_cache_bytes == 0
+        # Within a byte: each share is truncated to an int separately.
+        assert abs(vsql.buffer_bytes - (mariadb.buffer_bytes
+                                        + mariadb.graph_cache_bytes)) <= 1
+
+    def test_ops_and_ann_build_at_the_same_ef_construction(self):
+        from orchestrator.ops_pass import ops_ef_construction
+        profile = {"ann": {"villagesql_ef_construction": 160}}
+        assert ops_ef_construction("villagesql", profile) == 160
+        assert ops_ef_construction("villagesql", {}) == 200

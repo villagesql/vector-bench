@@ -104,8 +104,15 @@ build_engine() {
   # failed a build whose context prepare-sources had just reported ready.
   local kind; kind="$(yq_get "$cfg" source.kind "source")"
   if [[ "$kind" == "source" ]]; then
-    [[ -f "$ctx/source.tar" ]] \
-      || die "build context for $engine has no source.tar — run: scripts/prepare-sources.sh --engine $engine"
+    # One source.tar unless the engine declares `source.tarballs`: VillageSQL
+    # ships its server and extension trees separately so the Dockerfile can
+    # cache the server compile while the extension changes.
+    local tarballs; tarballs="$(list_for "$engine" source.tarballs)"
+    local tarball
+    for tarball in ${tarballs:-source.tar}; do
+      [[ -f "$ctx/$tarball" ]] \
+        || die "build context for $engine has no $tarball — run: scripts/prepare-sources.sh --engine $engine"
+    done
   fi
 
   # Re-stage the auxiliary files (entrypoint, init.sql, confs) on every build,
@@ -173,6 +180,9 @@ build_engine() {
     # the manifest's source record. docker/myvector/Dockerfile declares both.
     myvector) bargs+=(--build-arg "MYVECTOR_TAG=${tag}"
                       --build-arg "MYSQL_SERVER_TAG=$(yq_get "$cfg" source.server_tag unknown)") ;;
+    # The human label; both pinned commits reach the manifest through
+    # sources/villagesql.source.json. docker/villagesql/Dockerfile declares it.
+    villagesql) bargs+=(--build-arg "VILLAGESQL_TAG=${tag}") ;;
     # Nothing compiled: the module is copied out of its own published image.
     mongodb)  bargs+=(--build-arg "MONGOT_IMAGE=$(yq_get "$cfg" source.mongot_image "")") ;;
     # Nothing compiled: installed from a Percona repository. The package list
@@ -265,6 +275,9 @@ case "$ENGINE" in
   # MySQL 9.7 compiled from source with the MyVector plugin in-tree. Opt-in
   # for the same reason percona is: another full MySQL build.
   myvector)   build_engine myvector ;;
+  # VillageSQL server + the vsql_vector extension, both compiled from pinned
+  # commits. Opt-in for the same reason percona is.
+  villagesql) build_engine villagesql ;;
   mariadb|alisql|pgvector) build_engine "$ENGINE" ;;
   *) die "unknown engine: $ENGINE" ;;
 esac

@@ -509,6 +509,76 @@ its graph has the same headroom.
 
 ---
 
+## VillageSQL — vsql_vector as a server extension
+
+Source: `villagesql/villagesql-server` `main` at `00a43f63` (MySQL 8.4 based)
+and `villagesql/vsql-vector-pk` `main` at `42ffa04c`, the extension compiled
+against the server's build tree. The extension's README states the SQL surface
+and DML limits quoted below. Driver: `harness/drivers/villagesql.py`.
+
+The index is a loadable extension (`vsql_vector.veb`, installed once with
+`INSTALL EXTENSION` when the datadir is bootstrapped), not part of the server
+the way MHNSW, VIDX and Percona's InnoDB HNSW are. Its graph is InnoDB pages
+inside the table's own tablespace, so it is cached by the buffer pool.
+
+| | VillageSQL + vsql_vector |
+| --- | --- |
+| Column type | `SVECTOR(N)` |
+| Index DDL | `CREATE INDEX vi ON t1 (v hnsw_l2) USING EXTENDED(hnsw) WITH (M = 16, ef_construction = 200)`, separate from CREATE TABLE |
+| **M** / **ef_construction** | `WITH (...)` options; ef_construction is capped at **32 × M** |
+| Search width | `SET SESSION vsql_vector.ef_search` (default 40, floored at `LIMIT`) |
+| Distance fn | `L2_DISTANCE(v, '[…]')` / `COSINE_DISTANCE(v, '[…]')` |
+| Vector input | text literal `'[a,b,…]'` only; no binary form |
+| Storage engine | InnoDB only |
+| Graph location | pages in the table's own tablespace |
+| Build timing | incremental, on INSERT |
+| Optimizer | the default (classic) optimizer routes the scan |
+| Filtered search | **post-filter** over the top `max(ef_search, LIMIT)` candidates; declined |
+| DELETE / vector UPDATE | **refused** on an HNSW-indexed table; churn is declined |
+| CREATE INDEX on a populated table | **not safe** (can crash the server); the index is created before the load |
+
+### Trap 1 — the query vector must be a literal
+The extension serves `ORDER BY L2_DISTANCE(v, '<literal>') LIMIT k` only with
+the vector as a string literal; a placeholder or user variable fails with
+`ERROR 3219`. The driver and the ann module inline the vector on every query
+path.
+
+### Trap 2 — the plan marker is an iterator
+The routed scan appears as `Custom index distance scan on vi`, an iterator
+line, so the plan check uses `EXPLAIN FORMAT=TREE` rather than the
+`FORMAT=TRADITIONAL` the other MySQL-family drivers use. The marker text was
+observed on an earlier build; confirm it on this pin before trusting a
+"not used" verdict.
+
+### Trap 2a — `ef_search` is per connection
+`vsql_vector.ef_search` is a session variable. Every connection that queries
+sets it, including the ann module's batch workers; a `SET GLOBAL` would only
+change the default for connections opened afterwards.
+
+### Trap 3 — ef_construction above 32 × M fails the CREATE INDEX
+`M = 6, ef_construction = 200` is refused. The driver and module clamp to
+`32 × M` and record both the requested and the effective value.
+
+### Trap 4 — text binding defeats executemany batching
+MariaDB Connector/Python bulks `executemany` only for binary parameters; with
+a text vector it sends one INSERT per row (`Com_insert` equal to the row
+count). The ops driver builds one multi-row INSERT per 1000-row batch instead.
+The ann module still loads through the shared `executemany` loop.
+
+### Trap 5 — `-march` must reach both compiles through CMake
+Exported `CFLAGS` are ignored by the server's CMake and produced an SSE-only
+binary on an AVX-512 host. The Dockerfile passes `-march` through
+`-DCMAKE_C/CXX_FLAGS` to the server and to the extension, whose own CMake sets
+none. The extension is built `Release` regardless of `build.type`, and the
+build fails if no `-O` level reaches its distance kernel.
+
+### Index size
+`index_bytes` is the whole table's InnoDB footprint, rows included, because
+the graph shares the tablespace with them. It is an upper bound on the index
+and not comparable to MariaDB's or AliSQL's companion-table figures.
+
+---
+
 ## Things that are true of all of them
 
 - **The optimizer can always decline the index.** Every one of them will fall

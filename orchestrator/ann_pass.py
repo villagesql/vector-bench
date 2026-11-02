@@ -327,6 +327,28 @@ def render_config(engine: str, profile: Dict[str, Any],
             "query_args": query_args,
         }
 
+    elif engine == "villagesql":
+        # MyVector's shape: a build-time knob (ef_construction, a WITH option
+        # of the custom index) and a query-time one (`vsql_vector.ef_search`),
+        # so ef_construction is pinned in the normalized pass and swept only
+        # where the tuned pass asks. 200, the value every engine with the knob
+        # is built at; the module clamps it to the extension's 32 * M ceiling
+        # and records both. InnoDB only and built on INSERT, so there is no
+        # storage-engine or build-mode axis.
+        if resource_pass == "tuned" and extras.get("villagesql_ef_construction"):
+            ef_constructions = list(extras["villagesql_ef_construction"])
+        else:
+            ef_constructions = [int(ann.get("villagesql_ef_construction", 200))]
+        run_groups["innodb"] = {
+            "arg_groups": [{
+                "M": m_values,
+                "efConstruction": ef_constructions,
+                "engine": "InnoDB",
+            }],
+            "args": {},
+            "query_args": query_args,
+        }
+
     elif engine == "mongodb":
         # Quantization is the one axis no other engine has, so it follows the
         # ef_construction precedent exactly: pinned in the normalized pass, set

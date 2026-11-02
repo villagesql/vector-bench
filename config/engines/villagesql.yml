@@ -1,0 +1,146 @@
+# VillageSQL engine definition.
+#
+# Vector support: the vsql_vector EXTENSION (SVECTOR type + HNSW custom index)
+# loaded into a VillageSQL server (MySQL 8.4.10 based). Unlike MariaDB MHNSW,
+# AliSQL VIDX and Percona Server, which ship the vector index in the server,
+# VillageSQL's index is a loadable extension (a `.veb`) built against the
+# server's own build tree. The image therefore compiles TWO source trees: the
+# server, then the extension against it.
+#
+# What differs from the MySQL-family template, all of it handled in
+# harness/drivers/villagesql.py and the ann overlay module:
+#   * the column type is SVECTOR(N), not VECTOR(N);
+#   * the index is a separate `CREATE INDEX ... (v hnsw_<metric>)
+#     USING EXTENDED(hnsw) WITH (M = .., ef_construction = ..)`;
+#   * ef_construction IS a build knob, capped by the extension at 32 * M;
+#   * vectors are bound as the text literal '[..]' -- SVECTOR has no raw
+#     float32 input path -- and the QUERY vector is inlined into the SQL,
+#     because the extension serves `ORDER BY <DIST>(v, '<literal>') LIMIT k`
+#     only with a string literal (a placeholder fails with ERROR 3219);
+#   * ef_search is a session variable (`vsql_vector.ef_search`).
+name: villagesql
+display_name: VillageSQL (vsql_vector)
+family: mysql
+
+source:
+  kind: source
+  # A human label for the image tag and the manifest. The pins are the two
+  # commits below, which prepare-sources fetches by SHA and checks; the
+  # branches are where those commits were published, recorded in
+  # sources/villagesql.source.json for provenance and never followed.
+  tag: main-00a43f63
+  # Two build-context tarballs, not one source.tar: the Dockerfile COPYs them
+  # as separate layers so a new extension commit does not recompile the
+  # server. build-images.sh checks for exactly these.
+  tarballs: [server.tar, extension.tar]
+  server_upstream: https://github.com/villagesql/villagesql-server.git
+  server_branch: main
+  server_commit: 00a43f63a049037505a3290b48ef4b99ada1d5ff
+  extension_upstream: https://github.com/villagesql/vsql-vector-pk.git
+  extension_branch: main
+  extension_commit: 42ffa04cd219df3767d4d7bffeb7b47c22fb3b18
+
+image:
+  runtime: vector-bench/villagesql-runtime
+  bench: vector-bench/villagesql-bench
+  base: ubuntu:24.04
+
+build:
+  # RelWithDebInfo for the server, like every other engine built from source.
+  # The extension is built Release regardless (docker/villagesql/Dockerfile):
+  # an empty CMAKE_BUILD_TYPE leaves its distance kernel at -O0, roughly 6-10x
+  # slower, and the Dockerfile fails the build if no -O level is present.
+  type: RelWithDebInfo
+  # Passed to BOTH compiles through -DCMAKE_C/CXX_FLAGS. Exported CFLAGS are
+  # ignored by the server's CMake and produced an SSE-only binary on an
+  # AVX-512 host (0 ymm, 0 zmm instructions), which is the
+  # "never mix -march" failure in a form nothing reports.
+  march: x86-64-v3
+  cmake_flags:
+    - -DWITH_SSL=system
+    - -DWITH_BOOST=extra/boost
+    - -DDOWNLOAD_BOOST=1
+    - -DWITH_UNIT_TESTS=OFF
+    - -DWITH_ROUTER=OFF
+    - -DWITH_MYSQLX=OFF
+    - -DWITH_NDB=OFF
+    - -DPLUGIN_NDBCLUSTER=NO
+  extra_cxxflags: ""
+
+# There is deliberately no `sql:` block -- see config/engines/mariadb.yml and
+# tests/test_c1_engine_sql.py. Every statement is built in
+# harness/drivers/villagesql.py.
+
+server:
+  common:
+    - --skip-name-resolve
+    # MySQL 8.4 ships mysql_native_password disabled; the bench account is
+    # created with it so the client stack matches the other MySQL-family
+    # engines.
+    - --mysql-native-password=ON
+  normalized:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    - --innodb-flush-log-at-trx-commit=2
+    - --innodb-doublewrite=0
+    # Isolation parity with the other MySQL-family engines (AliSQL VIDX
+    # requires READ-COMMITTED); not a VillageSQL requirement.
+    - --transaction-isolation=READ-COMMITTED
+    # A text-literal vector is ~8 bytes per dimension, so a 1000-row batch of
+    # 784-dim vectors is ~6 MB; headroom over the 64 MB default is cheap.
+    - --max-allowed-packet=1073741824
+  tuned:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    - --innodb-flush-log-at-trx-commit=0
+    - --innodb-doublewrite=0
+    - --innodb-flush-method=O_DIRECT
+    - --transaction-isolation=READ-COMMITTED
+    - --max-allowed-packet=1073741824
+    - --skip-log-bin
+
+storage_engines:
+  normalized: [InnoDB]
+  tuned: [InnoDB]
+
+capabilities:
+  ef_construction_tunable: true
+  m_per_index: true
+  requires_read_committed: false
+  # FALSE, and the driver declines the workload (`FILTERED_DECLINED` in
+  # harness/drivers/villagesql.py): at this pin a WHERE beside the KNN
+  # ORDER BY is applied to the scan's top max(ef_search, LIMIT) candidates,
+  # after the search, so a selective predicate returns fewer than k rows.
+  # Measuring that would publish post-filtered recall as filtered search.
+  filtered_search: false
+  # Churn is declined too (`CHURN_DECLINED`): the extension refuses DELETE
+  # of a row in an HNSW-indexed table at this pin.
+  delete_supported: false
+
+runtime:
+  order: 90
+  driver: VillageSQLDriver
+  ann_constructor: VillageSQL
+  port: 3306
+  data_mount: /var/lib/vbench
+  server_data_mount: /server-data/data
+  # Must equal LOG_FILE's default in docker/villagesql/entrypoint-villagesql.sh.
+  error_log: /var/lib/vbench/villagesql.err
+  credentials:
+    user: "bench"
+    password: "bench"
+  group: extra
+  probe:
+    - "sh"
+    - "-c"
+    - "/opt/villagesql/bin/mysql -ubench -pbench --socket=/var/run/vbench/villagesql.sock -e 'SELECT 1' >/dev/null 2>&1"
+  chart:
+    color: "#8c564b"
+    marker: "h"
+    linestyle: "--"
+    label: "VillageSQL (vsql_vector HNSW)"
+  label: "VillageSQL (vsql_vector HNSW)"
+  # `ops`: resolved per profile and pass from what `ops_pass.harness_args`
+  # passes the harness (`ann.villagesql_ef_construction`, default 200), the
+  # same key the ann render reads in the normalized pass.
+  reference_build:
+    m: 16
+    ef_construction: ops

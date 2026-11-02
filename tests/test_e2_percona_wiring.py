@@ -96,6 +96,29 @@ PROSE_CLAIMS = {
             "all seven engines, which is what that command measures",
             "every one of the seven engines",
         ]),
+    "the engine count is nine": dict(
+        pattern=r"\b(all|every one of|each of)\b[^.]{0,24}?"
+                r"\b(nine|9)\b[^.]{0,24}?\bengines?\b",
+        accepts=[
+            "all nine engines, which is what that command measures",
+            "all nine of the engines",
+            "all 9 engines",
+        ],
+        rejects=[
+            "all eight engines, which is what that command measures",
+            "every one of the eight engines",
+        ]),
+    "the ingest figure covers seven of the nine": dict(
+        pattern=r"\bingest\b[^.]{0,80}?\bseven\b[^.]{0,40}?"
+                r"\b(measured rate|rate)\b",
+        accepts=[
+            "the ingest figure covers the seven with a measured rate",
+            "the ingest total is over the seven engines that have a rate",
+        ],
+        rejects=[
+            "the ingest figure covers all nine",
+            "Both figures cover all nine engines.",
+        ]),
     "the ingest figure covers seven of the eight": dict(
         pattern=r"\bingest\b[^.]{0,80}?\bseven\b[^.]{0,40}?"
                 r"\b(measured rate|rate)\b",
@@ -1620,7 +1643,8 @@ class TestAnUnmeasuredIngestRateIsNamedAndNotModelled:
         out = buf.getvalue()
         # MyVector is the registry's own unmeasured engine now, so the probe is
         # named beside it, in registry order, on the one disclosure line.
-        assert (f"No measured ingest rate for myvector, {self.UNMEASURED}"
+        assert (f"No measured ingest rate for myvector, villagesql, "
+                f"{self.UNMEASURED}"
                 in _flat(out))
         # The engine that gained a rate is on the per-engine line instead of
         # in the disclosure, which is the whole difference this change makes

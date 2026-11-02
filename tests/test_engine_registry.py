@@ -58,12 +58,19 @@ GOLDEN = {
                  "/server-data/data", ("bench", "bench"), "extra",
                  "#17becf", "X", ":", "MyVector (MySQL 9.7 plugin, hnswlib)",
                  "MyVector (MySQL 9.7 plugin, hnswlib)"),
+    # VillageSQL, a MySQL 8.4 server with the vsql_vector extension. A new
+    # constructor for the same reason as MyVector's, and the MySQL-family
+    # port, mounts and account.
+    "villagesql": ("VillageSQLDriver", "VillageSQL", 3306, "/var/lib/vbench",
+                   "/server-data/data", ("bench", "bench"), "extra",
+                   "#8c564b", "h", "--", "VillageSQL (vsql_vector HNSW)",
+                   "VillageSQL (vsql_vector HNSW)"),
 }
 
 # The order a run iterates and a report presents: the original three, then the
 # engines added later. Directory discovery is alphabetical and would not.
 GOLDEN_ORDER = ("mariadb", "alisql", "pgvector", "mariadb123", "mongodb",
-                "valkey", "percona", "myvector")
+                "valkey", "percona", "myvector", "villagesql")
 
 
 @pytest.fixture(scope="module")
@@ -118,7 +125,8 @@ class TestRegistry:
         # added to config/engines/ and not to this tuple fails here rather
         # than passing silently, which is what a `>=` or an `in` would do.
         assert engines_mod.engines_in_group("extra") == \
-            ("mariadb123", "mongodb", "valkey", "percona", "myvector")
+            ("mariadb123", "mongodb", "valkey", "percona", "myvector",
+             "villagesql")
 
     def test_get_unknown_names_the_alternatives(self):
         with pytest.raises(ValueError) as excinfo:

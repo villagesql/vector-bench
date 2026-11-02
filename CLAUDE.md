@@ -4,7 +4,7 @@ Guidance for Claude Code working in this repository.
 
 ## What this is
 
-`vector-bench` benchmarks **built-in vector search across eight database engines**, all
+`vector-bench` benchmarks **built-in vector search across nine database engines**, all
 running HNSW, so the comparison isolates implementation quality rather than algorithm
 choice. It is a measurement instrument: the most damaging bugs here do not crash — they
 quietly hand one engine a different budget, grid or dataset and produce a credible-looking
@@ -22,6 +22,7 @@ The repo root is `vector-bench/` (git repo, branch `master`). All commands below
 | `valkey` | Valkey + valkey-search | Percona repo `valkey-91` |
 | `percona` | Percona Server, InnoDB HNSW | `9.7` series, commit `56124b03` |
 | `myvector` | MyVector plugin (hnswlib) on MySQL 9.7.2 | release v1.26.9, commit `384d9df7` |
+| `villagesql` | VillageSQL (MySQL 8.4) + vsql_vector extension HNSW | server `main` `00a43f63`, vsql-vector-pk `main` `42ffa04c` |
 
 `KNOWN_ENGINES` is whatever `config/engines/*.yml` holds — there is no list in Python to keep
 in step with it. `orchestrator/engines.py` is the registry everything derives from.
@@ -153,9 +154,10 @@ reports the first's recall — this is why `mariadb123` exists) and a duplicate 
 
 These are the reasons the code looks over-defensive. Do not relax them.
 
-- **Never mix `-march` between engines.** The six built from source compile SIMD distance
+- **Never mix `-march` between engines.** The seven built from source compile SIMD distance
   kernels — `mariadb`, `mariadb123`, `alisql`, `pgvector`, `percona`, `myvector` (whose
-  kernels are hnswlib's, inside the plugin), all at `x86-64-v3`;
+  kernels are hnswlib's, inside the plugin), `villagesql` (whose kernels are the
+  extension's, compiled separately and given the same flag), all at `x86-64-v3`;
   `mongodb` and `valkey` are installed from packages and declare `march: none`. A different
   flag on one turns the benchmark into a comparison of compiler flags.
 - **`harness/` and `report/` must not import `orchestrator`.** Each runs in a container that
@@ -253,13 +255,15 @@ These are the reasons the code looks over-defensive. Do not relax them.
 
 Ingest dominates everything. MHNSW and VIDX build their graph on every INSERT (~150 and ~55
 rows/s on 1M rows), and **every M value reloads the whole corpus**. `--profile full
---resource-pass both` is ~796 h of ingest before a single query runs, and ~1,824 h of run time
-in the worst case once querying is counted — all eight engines, which is what that command
+--resource-pass both` is ~796 h of ingest before a single query runs, and ~1,828 h of run time
+in the worst case once querying is counted — all nine engines, which is what that command
 measures when `--engines` is omitted. **The two figures do not cover the same engines.** The
-run-time figure covers all eight; the ingest figure covers the seven with a measured rate.
-MyVector, the eighth, has none: the estimator names it in `engines_without_ingest_rate` and
-prints that the ingest total is a floor, and its query terms (concurrency windows, churn) are
-in the 1,824 h — its filtered-search term is not, because its driver declines that workload.
+run-time figure covers all nine; the ingest figure covers the seven with a measured rate.
+MyVector, the eighth, and VillageSQL, the ninth, have none: the estimator names them in
+`engines_without_ingest_rate` and prints that the ingest total is a floor. MyVector's query
+terms (concurrency windows, churn) are in the 1,828 h and its filtered-search term is not,
+because its driver declines that workload; VillageSQL's concurrency windows are in it (the
+~4 h the ninth engine added) and its filtered and churn terms are not, for the same reason.
 That figure was ~1,163 h until ops measurement version 9 raised the default churn budget from
 1800 s to 7200 s per step and added one discarded warm-up window per concurrency client count:
 the worst case charges the whole cap to every churn step of every unit, so the cap, not any

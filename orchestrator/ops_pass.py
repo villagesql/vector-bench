@@ -1445,4 +1445,8 @@ def ops_ef_construction(engine: str, profile: Dict[str, Any]) -> Optional[int]:
         # plugin's own default of 100, half what every other engine with the
         # knob is built at.
         return int(ann.get("myvector_ef_construction", 200))
+    if engine == "villagesql":
+        # The key and default the ann render reads, for the same reason as
+        # myvector. The driver clamps it to 32 * M and records both values.
+        return int(ann.get("villagesql_ef_construction", 200))
     return None

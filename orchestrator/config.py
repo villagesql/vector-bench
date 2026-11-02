@@ -442,6 +442,18 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         buffer_fraction = buffer_fraction + graph_fraction
         graph_fraction = 0.0
 
+    if engine == "villagesql":
+        # pgvector's reason, and not Percona's. vsql_vector's HNSW graph is
+        # InnoDB pages in the table's own tablespace, so it is cached in the
+        # buffer pool and nowhere else -- there is no graph cache to size, as
+        # MariaDB and AliSQL have, and no separate heap to leave room for, as
+        # Percona's graph is. Leaving the graph share unassigned would hand
+        # VillageSQL strictly less resident memory than the engines that use
+        # it, and in a RAM-capped run would page it to disk sooner for a
+        # reason of accounting rather than implementation.
+        buffer_fraction = buffer_fraction + graph_fraction
+        graph_fraction = 0.0
+
     # Taken here, before any engine-specific adjustment below. Every engine
     # under one pass sees the same declared knobs; what each does with them
     # differs by design, so hashing the resolved split fragments the results
