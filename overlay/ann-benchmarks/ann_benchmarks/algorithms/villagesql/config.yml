@@ -1,0 +1,21 @@
+# Default (full-profile) VillageSQL sweep.
+#
+# scripts/render-configs.py overwrites this file in the working copy according to
+# the selected profile, so editing it here only changes the standalone default.
+#
+# ef_construction is a real build knob here (unlike MHNSW and VIDX), pinned at
+# 200, the value every other engine with the knob is built at. The module clamps
+# it to the extension's 32 * M ceiling, so M=6 builds at 192 and says so.
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: VillageSQL
+    disabled: false
+    docker_tag: vector-bench/villagesql-bench
+    module: ann_benchmarks.algorithms.villagesql
+    name: villagesql
+    run_groups:
+      innodb:
+        arg_groups: [{M: [6, 8, 16, 24, 32], efConstruction: [200], engine: 'InnoDB'}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]

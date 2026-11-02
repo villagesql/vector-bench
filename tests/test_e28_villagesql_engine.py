@@ -152,3 +152,29 @@ class TestDeclined:
     def test_a_filtered_query_raises_rather_than_answering_unfiltered(self):
         with pytest.raises(NotImplementedError):
             driver().query_filtered(numpy.zeros(4), 10, 50)
+
+
+class TestAnnModule:
+    def test_both_march_readers_know_the_image(self):
+        """One reader per measurement path; an engine missing from either
+        records `march: unknown`, the field that exists to catch a mixed
+        build."""
+        for rel in ("harness/main.py",
+                    "overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py"):
+            with open(os.path.join(VB_ROOT, rel)) as fh:
+                assert "/opt/villagesql/.march" in fh.read(), rel
+
+    def test_the_module_inlines_the_query_vector_on_every_path(self):
+        """`query`, `batch_query`, the warm-up and the plan check must all
+        build the routed shape; a bound %s fails with ERROR 3219."""
+        with open(os.path.join(VB_ROOT, "overlay", "ann-benchmarks",
+                               "ann_benchmarks", "algorithms", "villagesql",
+                               "module.py")) as fh:
+            source = fh.read()
+        assert "_query_sql(" not in source
+        assert source.count("self._knn_sql(") >= 4
+        assert '"EXPLAIN FORMAT=TREE "' in source
+        # ef_search is per session, so the batch workers' connections must
+        # set it or they search at the default width.
+        worker = source.split("def worker")[1].split("chunks =")[0]
+        assert "self.dialect.set_ef_search" in worker
