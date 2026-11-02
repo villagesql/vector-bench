@@ -201,6 +201,33 @@ def load_engine(name: str) -> Dict[str, Any]:
     return _load(os.path.join(CONFIG_DIR, "engines", f"{name}.yml"))
 
 
+def image_commit_tag(engine: str, sources_dir: str) -> str:
+    """The registry tag for an engine's images: the source commits they hold.
+
+    Read from `sources/<engine>.source.json`, which prepare-sources writes, so
+    the tag names exactly what was compiled. Every key that is `commit` or ends
+    in `_commit` takes part, sorted by key and shortened to 12 characters, so
+    an engine built from two trees -- MyVector's plugin and server -- gets a
+    tag that moves when EITHER moves. Using `commit` alone would let a server
+    re-pin overwrite the previous image under an unchanged tag, which is the
+    thing an immutable tag exists to prevent.
+
+    "" when there is no manifest (an engine installed from packages or images,
+    which nothing here compiles) or it records no commit. The one definition:
+    scripts/build-images.sh calls this rather than keeping a shell copy that
+    could disagree about which image a tag names.
+    """
+    import json
+    try:
+        with open(os.path.join(sources_dir, f"{engine}.source.json")) as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    commits = sorted((key, str(value)) for key, value in meta.items()
+                     if (key == "commit" or key.endswith("_commit")) and value)
+    return "-".join(value[:12] for _, value in commits)
+
+
 def available_profiles() -> List[str]:
     d = os.path.join(CONFIG_DIR, "profiles")
     return sorted(f[:-4] for f in os.listdir(d) if f.endswith(".yml"))

@@ -9031,3 +9031,72 @@ def _expand_cpuset(text):
         elif part:
             cpus.add(int(part))
     return cpus
+
+
+class TestRegistryImagesAreNamedByTheirSourceCommits:
+    """`build --push` publishes and `run --registry` pulls, on different
+    machines, so both must derive one tag from one rule. A tag that ignored
+    one of an engine's source trees would let a re-pin of that tree overwrite
+    the previous image under an unchanged name, and a machine pulling it
+    would measure a different build than its manifest's sources record."""
+
+    @staticmethod
+    def _meta(tmp_path, engine, **fields):
+        (tmp_path / f"{engine}.source.json").write_text(json.dumps(fields))
+
+    def test_a_single_commit_is_the_tag(self, tmp_path):
+        from orchestrator.config import image_commit_tag
+        self._meta(tmp_path, "mariadb", tag="mariadb-11.8.8", commit="a" * 40)
+        assert image_commit_tag("mariadb", str(tmp_path)) == "a" * 12
+
+    def test_every_source_tree_moves_the_tag(self, tmp_path):
+        """MyVector's manifest records the plugin as `commit` and the server
+        as `server_commit`; both are in the tag, in key order."""
+        from orchestrator.config import image_commit_tag
+        self._meta(tmp_path, "myvector", commit="b" * 40,
+                   server_commit="c" * 40, origin="x")
+        assert image_commit_tag("myvector", str(tmp_path)) == \
+            f"{'b' * 12}-{'c' * 12}"
+
+    def test_no_manifest_means_no_tag(self, tmp_path):
+        from orchestrator.config import image_commit_tag
+        assert image_commit_tag("valkey", str(tmp_path)) == ""
+
+    def test_run_pulls_both_images_under_their_local_names(
+            self, tmp_path, monkeypatch):
+        """Tagged under the configured name, so every reader of
+        `image.runtime` / `image.bench` -- the passes and the manifest's
+        image IDs -- sees the pulled image without knowing a registry
+        exists."""
+        from orchestrator import cli
+        self._meta(tmp_path, "mariadb", commit="d" * 40)
+        pulled = []
+        monkeypatch.setattr(cli.docker_ctl, "pull_as",
+                            lambda remote, local: pulled.append((remote, local)))
+        images = load_engine("mariadb")["image"]
+        assert cli.pull_prebuilt_images("reg.example/vb/", ["mariadb"],
+                                        str(tmp_path)) == []
+        assert pulled == [
+            (f"reg.example/vb/mariadb-runtime:{'d' * 12}", images["runtime"]),
+            (f"reg.example/vb/mariadb-bench:{'d' * 12}", images["bench"]),
+        ]
+
+    def test_run_names_every_engine_it_cannot_pull(self, tmp_path, monkeypatch):
+        from orchestrator import cli
+        self._meta(tmp_path, "alisql", commit="e" * 40)
+
+        def fail(remote, local):
+            raise cli.docker_ctl.DockerError("manifest unknown")
+        monkeypatch.setattr(cli.docker_ctl, "pull_as", fail)
+        problems = cli.pull_prebuilt_images("reg", ["mariadb", "alisql"],
+                                            str(tmp_path))
+        assert any(p.startswith("mariadb:") and "prepare-sources" in p
+                   for p in problems)
+        assert sum(p.startswith("alisql:") for p in problems) == 2
+
+    def test_push_refuses_an_engine_with_no_commit(self):
+        """Pushing under the human tag would let a rebuild from another
+        commit at the same release overwrite an image someone is pulling."""
+        script = open(os.path.join(VB_ROOT, "scripts", "build-images.sh")).read()
+        assert "image_commit_tag" in script
+        assert 'cannot --push $engine' in script

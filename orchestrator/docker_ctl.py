@@ -69,6 +69,19 @@ def image_id(image: str) -> str:
         return "unknown"
 
 
+def pull_as(remote: str, local: str, timeout: int = 1800) -> None:
+    """Pull `remote` and tag it as `local`. Raises DockerError on failure.
+
+    Tagged under the engine's configured local name rather than run under its
+    registry name, because the configured name is what every reader of
+    `image.runtime` / `image.bench` uses -- the passes, the cleanup and
+    ownership helpers, and the manifest, which then records the pulled
+    image's own ID.
+    """
+    _run(["docker", "pull", remote], timeout=timeout)
+    _run(["docker", "tag", remote, local], timeout=30)
+
+
 # ---------------------------------------------------------------------------
 # Networks and volumes
 # ---------------------------------------------------------------------------

@@ -129,6 +129,7 @@ only SSH'd into.
 | `--fail-fast` | off | Stop at the first failure instead of continuing |
 | `--no-report` | off | Skip report generation |
 | `--run-id` | timestamped | Reuse an id to add to an existing run directory |
+| `--registry` | off | Pull each engine's images from this registry prefix instead of using local builds (see `build --push`). prepare-sources must still run: the image tag is the pinned source commit |
 
 **`--engines` and `--datasets` are not symmetrical, deliberately.** A profile's
 dataset list is a choice of corpus and `--datasets` replaces it outright. A
@@ -150,6 +151,7 @@ reading it as "no restriction" is how a one-engine profile measured seven.
 | `--march` | **SIMD baseline for every engine.** See below. |
 | `--jobs` | Compile parallelism (default: all cores) |
 | `--no-cache` | Force a clean rebuild |
+| `--push` | Also push each image to this registry prefix as `<prefix>/<engine>-<target>:<commit tag>`, where the tag is every pinned source commit of the engine. Needs `docker login` (or `gcloud auth configure-docker`) first |
 
 ### `generate` options
 

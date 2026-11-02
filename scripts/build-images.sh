@@ -11,11 +11,18 @@
 #                           [--target runtime|bench|all]
 #                           [--march x86-64-v3|native|...]
 #                           [--jobs N] [--no-cache] [--pull]
+#                           [--push REGISTRY]
 #
 # --march is the flag that decides which SIMD path the distance kernels take.
 # Every engine gets the SAME value, because otherwise the benchmark compares
 # compiler flags rather than implementations. Use `native` only when the build
 # host and the benchmark host are the same machine.
+#
+# --push also publishes each image as <REGISTRY>/<engine>-<target>:<commit tag>,
+# where the tag is every source commit the engine was built from
+# (orchestrator/config.py:image_commit_tag), so `run --registry REGISTRY` on
+# another machine pulls exactly this build. Needs `docker login` (or
+# `gcloud auth configure-docker <host>`) to have been run here first.
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -25,6 +32,7 @@ TARGET=all
 MARCH=""
 JOBS=0
 EXTRA_BUILD_ARGS=()
+PUSH_REGISTRY=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,7 +46,9 @@ while [[ $# -gt 0 ]]; do
     --jobs=*) JOBS="${1#*=}"; shift ;;
     --no-cache) EXTRA_BUILD_ARGS+=(--no-cache); shift ;;
     --pull) EXTRA_BUILD_ARGS+=(--pull); shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    --push) PUSH_REGISTRY="${2%/}"; shift 2 ;;
+    --push=*) PUSH_REGISTRY="${1#*=}"; PUSH_REGISTRY="${PUSH_REGISTRY%/}"; shift ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -128,6 +138,12 @@ build_engine() {
   local cxxextra; cxxextra="$(yq_get "$cfg" build.extra_cxxflags "")"
   local optflags; optflags="$(yq_get "$cfg" build.optflags "")"
   local flags;    flags="$(cmake_flags_for "$engine")"
+  local commit_tag=""
+  if [[ -n "$PUSH_REGISTRY" ]]; then
+    commit_tag="$(cd "$VB_ROOT" && python3 -c \
+      'import sys; from orchestrator.config import image_commit_tag; print(image_commit_tag(sys.argv[1], sys.argv[2]))' \
+      "$engine" "$VB_SOURCES")"
+  fi
 
   local -a bargs=(
     --build-arg "BASE_IMAGE=${base}"
@@ -193,6 +209,19 @@ build_engine() {
       "$ctx" \
       || die "build failed for $engine target $t"
     ok "built ${img}:${tag} in $(( $(date +%s) - start ))s"
+
+    if [[ -n "$PUSH_REGISTRY" ]]; then
+      # Refused rather than pushed under the human tag: a tag like
+      # `mariadb-11.8.8` names a release, and a rebuild from a different
+      # commit at the same release would overwrite the image another machine
+      # is about to measure.
+      [[ -n "$commit_tag" ]] \
+        || die "cannot --push $engine: sources/${engine}.source.json records no commit (run scripts/prepare-sources.sh --engine $engine)"
+      local remote="${PUSH_REGISTRY}/${engine}-${t}:${commit_tag}"
+      docker tag "${img}:${tag}" "$remote" || die "docker tag failed: $remote"
+      docker push "$remote" || die "docker push failed: $remote (is registry auth configured?)"
+      ok "pushed $remote"
+    fi
   done
 
   # Record what was actually built, for the run manifest.

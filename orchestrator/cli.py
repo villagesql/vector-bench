@@ -42,7 +42,8 @@ from orchestrator import ann_pass, ann_provenance, docker_ctl, ops_pass  # noqa:
 from orchestrator.engine_plan import resolve_engines as _resolve_engines  # noqa: E402
 from orchestrator import engines as engines_mod  # noqa: E402
 from orchestrator.config import (available_profiles, dedupe,  # noqa: E402
-                                 engines_outside_profile, load_engine,
+                                 engines_outside_profile, image_commit_tag,
+                                 load_engine,
                                  load_profile, load_resources,
                                  merge_resource_overrides, profile_engines,
                                  profile_engines_problem, profile_max_clients,
@@ -183,6 +184,8 @@ def cmd_build(args: argparse.Namespace) -> int:
         build_args += ["--jobs", str(args.jobs)]
     if args.no_cache:
         build_args.append("--no-cache")
+    if getattr(args, "push", None):
+        build_args += ["--push", args.push]
     return _script("build-images.sh", *build_args)
 
 
@@ -371,6 +374,44 @@ def _cpuset_size(cpuset: str) -> int:
     return size
 
 
+def pull_prebuilt_images(registry: str, engines: List[str],
+                         sources_dir: str) -> List[str]:
+    """Pull every engine's runtime and bench image from `registry`.
+
+    The images are the ones `scripts/build-images.sh --push` published, at
+    `<registry>/<engine>-<runtime|bench>:<commit tag>`, so a corpus can be
+    measured on a machine that never compiled the engine -- an AliSQL build
+    is 1.5-3 h, on every box. The tag comes from the same source manifest the
+    push used (`config.image_commit_tag`), so prepare-sources still has to run
+    here: it pins the commit, and pulling by commit is what makes the image the
+    one that was built from it rather than whatever was pushed last.
+
+    Each pull is tagged under the engine's configured local name, so nothing
+    after this point knows or cares where an image came from and the manifest
+    records the pulled image's ID. Returns one problem per engine that could
+    not be pulled, rather than stopping at the first.
+    """
+    problems: List[str] = []
+    for engine in engines:
+        tag = image_commit_tag(engine, sources_dir)
+        if not tag:
+            problems.append(
+                f"{engine}: no commit in sources/{engine}.source.json to name "
+                f"its registry image; run scripts/prepare-sources.sh "
+                f"--engine {engine}")
+            continue
+        images = load_engine(engine).get("image", {}) or {}
+        for variant in ("runtime", "bench"):
+            local = images.get(variant, f"vector-bench/{engine}-{variant}")
+            remote = f"{registry.rstrip('/')}/{engine}-{variant}:{tag}"
+            print(f"[registry] pulling {remote} as {local}")
+            try:
+                docker_ctl.pull_as(remote, local)
+            except docker_ctl.DockerError as exc:
+                problems.append(f"{engine}: {remote}: {exc}")
+    return problems
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not docker_ctl.docker_available():
         print("cannot talk to the Docker daemon", file=sys.stderr)
@@ -496,6 +537,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                   f"              which means a multi-GB download and brute-force "
                   f"ground truth)", file=sys.stderr)
         return 3
+
+    if args.registry:
+        problems = pull_prebuilt_images(args.registry, engines, paths["sources"])
+        if problems:
+            print("\ncannot use the registry images:", file=sys.stderr)
+            for problem in problems:
+                print(f"  - {problem}", file=sys.stderr)
+            return 3
 
     # Two refusals before anything is loaded, both for failures that would
     # otherwise surface only in the report, hours later and quietly.
@@ -1906,6 +1955,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="SIMD baseline for every engine, e.g. x86-64-v3 or native")
     b.add_argument("--jobs", type=int, default=0)
     b.add_argument("--no-cache", action="store_true")
+    b.add_argument("--push", default=None, metavar="REGISTRY",
+                   help="also push each image to REGISTRY under its source "
+                        "commit tag, for `run --registry` on another machine")
     b.set_defaults(func=cmd_build)
 
     f = sub.add_parser("fetch", help="download datasets")
@@ -1947,6 +1999,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="re-run ann-benchmarks points that already have results")
     run.add_argument("--fail-fast", action="store_true")
     run.add_argument("--no-report", action="store_true")
+    run.add_argument("--registry", default=None,
+                     help="pull each engine's images from this registry prefix "
+                          "instead of using locally built ones, e.g. "
+                          "REGION-docker.pkg.dev/PROJECT/REPO; see "
+                          "scripts/build-images.sh --push")
     run.set_defaults(func=cmd_run)
 
     rep = sub.add_parser("report", help="generate the report for an existing run")
