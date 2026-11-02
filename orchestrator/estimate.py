@@ -652,8 +652,8 @@ def _charged_scan_modes(plan: _QueryPlan) -> List[str]:
     return _declared_scan_modes(plan.ops.get("pgvector_iterative_scan"))
 
 
-def _runs_filtered_search(engine: str) -> bool:
-    """False only for an engine whose config declares `filtered_search: false`.
+def _declared_capability(engine: str, key: str, workload: str) -> bool:
+    """False only for an engine whose config declares `capabilities.<key>: false`.
 
     Read from the engine config and not from the driver, which lives in
     `harness/` where the orchestrator must not reach. The two are held in
@@ -674,10 +674,25 @@ def _runs_filtered_search(engine: str) -> bool:
         return True
     except (OSError, yaml.YAMLError) as exc:
         print(f"[estimate] WARNING: could not read config/engines/{engine}.yml "
-              f"({exc}); charging its filtered-search term as if the engine "
+              f"({exc}); charging its {workload} terms as if the engine "
               f"ran it", file=sys.stderr)
         return True
-    return caps.get("filtered_search", True) is not False
+    return caps.get(key, True) is not False
+
+
+def _runs_filtered_search(engine: str) -> bool:
+    return _declared_capability(engine, "filtered_search", "filtered-search")
+
+
+def _runs_churn(engine: str) -> bool:
+    """False for an engine that declares `delete_supported: false`.
+
+    Churn is delete-and-reinsert, so its driver declines the workload
+    (`EngineDriver.declined_workloads`) exactly as a driver without filtered
+    search declines that one, and the same rule applies: no charge for steps
+    the harness will skip. VillageSQL is the one engine that declares it.
+    """
+    return _declared_capability(engine, "delete_supported", "churn")
 
 
 def _filtered_search(plan: _QueryPlan) -> Optional[_QueryTerm]:
@@ -876,7 +891,8 @@ def _churn_reinsert(plan: _QueryPlan) -> Optional[_QueryTerm]:
     three engines and six, one pass and two -- every published figure and
     every `query_worst_case_is_a_ceiling` is unchanged.
     """
-    if "churn" not in plan.workloads or plan.rows <= 0:
+    if ("churn" not in plan.workloads or plan.rows <= 0
+            or not _runs_churn(plan.engine)):
         return None
     fractions = [float(f) for f in plan.ops.get("churn_fractions", [0.1])]
     # `or 0.0` so a key present with value null means "no cap" rather than a
@@ -966,7 +982,8 @@ def _churn_reader_baseline(plan: _QueryPlan) -> Optional[_QueryTerm]:
     None when the pool is off, which is `ops.churn_readers: 0` and is what
     `dev` runs: no readers, no baseline window, no cost.
     """
-    if "churn" not in plan.workloads or plan.rows <= 0:
+    if ("churn" not in plan.workloads or plan.rows <= 0
+            or not _runs_churn(plan.engine)):
         return None
     readers = _churn_readers_declared(plan.ops)
     if readers <= 0:

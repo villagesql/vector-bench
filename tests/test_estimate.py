@@ -2258,3 +2258,32 @@ class TestTheWebUiAndTheCliCannotDisagree:
             source = fh.read()
         assert "worst_case_total_hours" in source
         assert "query_terms" in source
+
+
+class TestChurnIsNotChargedToAnEngineThatDeclinesIt:
+    """`delete_supported: false` declines churn the way `filtered_search:
+    false` declines filtered search, so the estimate must not put churn
+    ceilings into the total for steps the harness will skip."""
+
+    def _caps(self, monkeypatch, caps):
+        from orchestrator import config
+        real = config.load_engine
+
+        def load(name):
+            cfg = dict(real("mariadb"))
+            cfg["capabilities"] = caps
+            return cfg if name == "e-churnless" else real(name)
+        monkeypatch.setattr(config, "load_engine", load)
+
+    def test_the_gate_reads_delete_supported(self, monkeypatch):
+        self._caps(monkeypatch, {"delete_supported": False})
+        assert est_mod._runs_churn("e-churnless") is False
+        assert est_mod._runs_churn("mariadb") is True
+
+    def test_both_churn_terms_drop_out(self, monkeypatch):
+        self._caps(monkeypatch, {"delete_supported": False})
+        e = est("main", engines=["e-churnless"])
+        names = [t["name"] for t in e["query_terms"]]
+        assert "churn re-insert" not in names
+        assert "churn reader baseline" not in names
+        assert "concurrency windows" in names
