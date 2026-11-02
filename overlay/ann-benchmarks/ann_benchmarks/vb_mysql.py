@@ -111,6 +111,17 @@ class VBMySQLBase(IndexWarmupMixin, BaseANN):
 
     dialect: Dialect  # set by subclasses
 
+    def encode_vector(self, vector) -> Any:
+        """The value bound for a vector column on INSERT.
+
+        Raw float32 for MariaDB, AliSQL and Percona, whose VECTOR columns take
+        it directly (see `to_binary_f32`). A method rather than a direct call in
+        `_insert_serial` so that an engine whose vector type only parses a text
+        literal can say so here without a second copy of the batched load loop,
+        which is the arrangement where two loops drift.
+        """
+        return to_binary_f32(vector)
+
     # ------------------------------------------------------------------
     # Construction / server lifecycle
     # ------------------------------------------------------------------
@@ -321,7 +332,7 @@ class VBMySQLBase(IndexWarmupMixin, BaseANN):
 
         for i, embedding in enumerate(X):
             idx = offset + i
-            rows.append((idx, idx % 100, to_binary_f32(embedding)))
+            rows.append((idx, idx % 100, self.encode_vector(embedding)))
             if len(rows) >= INSERT_BATCH:
                 cur.executemany(sql, rows)
                 cur.execute("COMMIT")
