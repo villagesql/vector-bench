@@ -18,9 +18,14 @@
 #     flat from one client to thirty-two while pgvector reaches 21.7x, so this
 #     is the most directly testable claim in the set.
 #
-#   * Its query planner chooses between pre-filtering and inline filtering per
-#     query. That is a third filtering strategy: the SQL engines post-filter
-#     and Percona Search pre-filters.
+#   * Its documentation describes a query planner that chooses between
+#     pre-filtering and inline filtering per query. The run of 2026-08-25 did
+#     not observe that: filtered latency rose from 18.2 ms at 10% selectivity
+#     to 120.6 ms at 1%, which is what walking the graph costs and the inverse
+#     of what pre-filtering costs. scripts/probe-valkey-filter.py exists to
+#     find out whether the planner is reachable from a plain FT.SEARCH at all.
+#     The report derives each engine's strategy from its own latency rather
+#     than from this note.
 #
 # THE TRAP THIS CONFIG EXISTS TO AVOID
 #
@@ -107,12 +112,14 @@ server:
     - --maxmemory
     - "{maxmemory_bytes}"
     - --io-threads
-    - "{server_cpu_count}"
+    # Clamped, not the cpuset. See cpu.max_io_threads.
+    - "{io_threads}"
   tuned:
     - --maxmemory
     - "{maxmemory_bytes}"
     - --io-threads
-    - "{server_cpu_count}"
+    # Clamped, not the cpuset. See cpu.max_io_threads.
+    - "{io_threads}"
 
 resources:
   # No buffer pool and no graph cache: the dataset is resident by definition.
@@ -137,8 +144,70 @@ capabilities:
   ef_construction_normalized: 200
   # Documented lock-free read path with a reader thread pool.
   reader_thread_pool: true
-  # The query planner chooses per query rather than committing to one strategy.
-  hybrid_filter_planner: true
+  # Documented, not observed. It is recorded as null rather than true because
+  # this field lands in the records, and a `true` there reads as a measured
+  # fact -- which is exactly how the claim survived into the report for weeks.
+  # See the note at the top of this file.
+  hybrid_filter_planner: null
   # Nothing is written to disk, so the on-disk footprint comparison does not
   # include it and index size is measured as resident bytes.
   in_memory_only: true
+
+# Runtime facts the orchestrator needs to start and speak to this engine.
+#
+# These used to be six dictionaries keyed by engine name, spread across
+# ann_pass, ops_pass, cli, charts and render. Adding an engine meant finding all
+# six, and missing one produced a failure hours later rather than at load. They
+# live here because everything else about an engine already does.
+runtime:
+  # Which harness driver drives it. A new *architecture* needs a new
+  # driver in harness/drivers/; a new variant of this family does not.
+  # Presentation and iteration order. Discovery is by directory, which is
+  # alphabetical, and alphabetical is not the order this comparison is read
+  # in -- the original three come first.
+  order: 60
+  driver: ValkeyDriver
+  # Class name ann-benchmarks expects in the generated config.yml.
+  ann_constructor: ValkeySearch
+  port: 6379
+  # Where the server keeps its data inside the image.
+  data_mount: /var/lib/vbench
+  # No read-only sizing mount: the index is not a separate on-disk artifact.
+  server_data_mount: null
+  credentials:
+    user: ""
+    password: ""
+  # Opt-in engines are not in the original three-way comparison.
+  group: extra
+  # Readiness probe, run inside the server container until it succeeds.
+  probe:
+    - "sh"
+    - "-c"
+    - "valkey-cli MODULE LIST 2>/dev/null | grep -qi search"
+  chart:
+    # Its own hue as well: the only in-memory engine, so it should not
+    # read as a variant of any disk-backed one.
+    color: "#e377c2"
+    marker: "D"
+    linestyle: "-"
+    label: "Valkey (valkey-search)"
+  label: "Valkey (valkey-search)"
+  # The index the ops pass builds. §4's secondary table ("at the build the
+  # ops pass measured") is taken from it, and a headline floor figure from any
+  # other build is marked, because the load, build, concurrency, filtered and
+  # churn sections describe this index. `full-20260825` published Percona
+  # Search's floor figures from the unquantized sweep beside ops figures from
+  # the scalar index (which peaks at recall 0.892), and
+  # pgvector's and Valkey's from efC=400 beside ops figures at 200 and the
+  # server default. A value of `ops` is resolved per profile and
+  # pass from what `orchestrator/ops_pass.py` passes the harness
+  # (`orchestrator/reference_build.py`), and `cmd_run` refuses a build the ann grid
+  # does not contain rather than reporting "—" for a whole engine afterwards.
+  # A literal, because the ops pass passes no EF_CONSTRUCTION and the driver
+  # then omits it from FT.CREATE: the server default builds the index.
+  # valkey-search's default is 200 (`kDefaultEFConstruction` in
+  # src/commands/ft_create_parser.h, and "The default value is 200" in its
+  # FT.CREATE documentation), which is also what the ann module pins.
+  reference_build:
+    m: 16
+    ef_construction: 200

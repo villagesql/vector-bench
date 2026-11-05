@@ -60,32 +60,21 @@ build:
     - -DWITH_SSL=system
     - -DWITH_ZLIB=system
 
-# How this engine expresses vector search. Consumed by the ops-harness driver
-# and by the doc generator so the manual instructions never drift from the code.
-sql:
-  # Session setup executed on every connection before any vector work.
-  session_setup:
-    - "SET SESSION default_storage_engine = InnoDB"
-  # {dim}, {metric}, {m}, {engine} are substituted by the driver.
-  create_table: |
-    CREATE TABLE {table} (
-      id INT PRIMARY KEY,
-      v VECTOR({dim}) NOT NULL,
-      VECTOR INDEX (v) M={m} DISTANCE={metric}
-    ) ENGINE={engine}
-  # MariaDB accepts a raw little-endian float32 binary string for VECTOR.
-  insert: "INSERT INTO {table} (id, v) VALUES (%s, %s)"
-  vector_binding: binary_f32
-  query: "SELECT id FROM {table} ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
-  query_filtered: "SELECT id FROM {table} WHERE tag < %s ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
-  set_ef_search: "SET mhnsw_ef_search = {ef_search}"
-  explain: "EXPLAIN {query}"
-  # A plan is only accepted if this appears in EXPLAIN output. Guards against
-  # silently benchmarking a brute-force scan.
-  index_plan_marker: "v"
-  metrics:
-    angular: cosine
-    euclidean: euclidean
+# There is deliberately no `sql:` block. Every statement the ops harness sends
+# is built in harness/drivers/mysql_family.py -- harness/ is mounted into the
+# bench container on its own and cannot read config/, so nothing here could
+# ever have been executed. The statements that do belong to this engine and are
+# not in that file are `runtime.probe`'s below, and the account setup in
+# docker/mariadb/init.sql that --init-file runs on every start.
+#
+# A block did sit here, and three separate things in it had gone wrong, none of
+# them noticed because no reader existed: a CREATE TABLE with no `tag` column
+# beside its own `tag` filter, no mention of `ctag` once that column arrived,
+# and `index_plan_marker: "v"` where the driver names the index `vi`. A single
+# `"v"` would have matched almost any EXPLAIN output, since the real check is a
+# substring test (`dialect.index_name in plan`) -- so the one key CLAUDE.md
+# defended as harmless documentation was both unread and wrong.
+# tests/test_c1_engine_sql.py fails if a block comes back.
 
 # Server knobs, per fairness pass. {mem_bytes} etc. are filled by the harness.
 server:
@@ -112,6 +101,18 @@ server:
     - --innodb-doublewrite=0
     - --innodb-flush-method=O_DIRECT
     - --skip-log-bin
+  # Opt-in, ops path only: rendered after the pass's flags when a profile
+  # sets `ops.server_wait_instruments: true` (`config.ops_wait_instruments`),
+  # and recorded in `engines_resolved` and on every record when it is.
+  # MariaDB ships performance_schema OFF, so with the key off its records
+  # carry no wait profile and say why; on, this also switches
+  # performance_schema itself on and allocates its memory. Measure the
+  # overhead in a smoke run before publishing with it on.
+  wait_instruments:
+    - --performance-schema=ON
+    - --performance-schema-instrument=wait/synch/mutex/%=ON
+    - --performance-schema-instrument=wait/synch/rwlock/%=ON
+    - --performance-schema-instrument=wait/synch/sxlock/%=ON
 
 # Storage engines to test. InnoDB only: MyISAM is faster on every axis we
 # measured but is not transactional, so it is not a configuration vector search
@@ -127,3 +128,64 @@ capabilities:
   m_per_index: true
   requires_read_committed: false
   filtered_search: true
+
+# Runtime facts the orchestrator needs to start and speak to this engine.
+#
+# These used to be six dictionaries keyed by engine name, spread across
+# ann_pass, ops_pass, cli, charts and render. Adding an engine meant finding all
+# six, and missing one produced a failure hours later rather than at load. They
+# live here because everything else about an engine already does.
+runtime:
+  # Which harness driver drives it. A new *architecture* needs a new
+  # driver in harness/drivers/; a new variant of this family does not.
+  # Presentation and iteration order. Discovery is by directory, which is
+  # alphabetical, and alphabetical is not the order this comparison is read
+  # in -- the original three come first.
+  order: 40
+  driver: MariaDBDriver
+  # Class name ann-benchmarks expects in the generated config.yml.
+  ann_constructor: MariaDB123
+  port: 3306
+  # Where the server keeps its data inside the image.
+  data_mount: /var/lib/vbench
+  server_data_mount: /server-data/data
+  # Same path as 11.8: `alias_of: mariadb` means this engine is built from and
+  # started by docker/mariadb/entrypoint-mariadb.sh, so LOG_FILE's default
+  # there is this engine's error log too. The value is repeated rather than
+  # inherited because nothing merges one engine config into another, and
+  # tests/test_e10_failures_explain_themselves.py checks it against the
+  # entrypoint the alias resolves to.
+  error_log: /var/lib/vbench/mariadb.err
+  credentials:
+    user: "bench"
+    password: "bench"
+  # Opt-in engines are not in the original three-way comparison.
+  group: extra
+  # Readiness probe, run inside the server container until it succeeds.
+  probe:
+    - "sh"
+    - "-c"
+    - "/opt/mariadb/bin/mariadb -ubench -pbench --socket=/var/run/vbench/mariadb.sock -e 'SELECT 1' >/dev/null 2>&1"
+  chart:
+    # Same hue family as 11.8 so the two versions read as related,
+    # dashed so they stay distinguishable in greyscale and for
+    # colour-blind readers.
+    color: "#5fa8d3"
+    marker: "s"
+    linestyle: "--"
+    label: "MariaDB 12.3 (MHNSW)"
+  label: "MariaDB 12.3 (MHNSW)"
+  # The index the ops pass builds. §4's secondary table ("at the build the
+  # ops pass measured") is taken from it, and a headline floor figure from any
+  # other build is marked, because the load, build, concurrency, filtered and
+  # churn sections describe this index. `full-20260825` published Percona
+  # Search's floor figures from the unquantized sweep beside ops figures from
+  # the scalar index (which peaks at recall 0.892), and
+  # pgvector's and Valkey's from efC=400 beside ops figures at 200 and the
+  # server default. A value of `ops` is resolved per profile and
+  # pass from what `orchestrator/ops_pass.py` passes the harness
+  # (`orchestrator/reference_build.py`), and `cmd_run` refuses a build the ann grid
+  # does not contain rather than reporting "—" for a whole engine afterwards.
+  # Graph degree is MHNSW's only build knob; the ops pass builds M=16.
+  reference_build:
+    m: 16

@@ -7,7 +7,8 @@
 #   <engine>-bench    runtime + the ann-benchmarks Python stack
 #
 # Usage:
-#   scripts/build-images.sh [--engine mariadb|mariadb123|alisql|pgvector|all]
+#   scripts/build-images.sh [--engine mariadb|mariadb123|alisql|pgvector|percona|myvector|
+#                                     villagesql|villagesql84|mongodb|valkey|webui|all]
 #                           [--target runtime|bench|all]
 #                           [--march x86-64-v3|native|...]
 #                           [--jobs N] [--no-cache] [--pull]
@@ -98,6 +99,23 @@ build_engine() {
       || die "build context for $engine has no source.tar — run: scripts/prepare-sources.sh --engine $engine"
   fi
 
+  # Re-stage the auxiliary files (entrypoint, init.sql, confs) on every build,
+  # in the order and with the alias lookup `stage_context` in prepare-sources.sh
+  # uses: _shared first, then the engine's own directory, which may override a
+  # shared file. The source tarball is the expensive, commit-pinned part and
+  # stays prepare-sources' job; the aux files are cheap, and without this a
+  # build used whatever prepare-sources last staged, so an entrypoint fix did
+  # not reach the image until prepare-sources was run again -- and nothing
+  # said so. The Dockerfile is excluded because the build reads it from
+  # docker/ directly (`-f` below), never from the context.
+  local aux; aux="$(yq_get "$cfg" alias_of "$engine")"
+  if [[ -d "$VB_DOCKER/$aux" ]]; then
+    find "$VB_DOCKER/_shared" -maxdepth 1 -type f \
+         -exec cp {} "$ctx/" \; 2>/dev/null || true
+    find "$VB_DOCKER/$aux" -maxdepth 1 -type f ! -name 'Dockerfile' \
+         -exec cp {} "$ctx/" \; 2>/dev/null || true
+  fi
+
   # Engines we compile carry a git tag. Percona Search is a published image and
   # Valkey is a package set, so they carry a version instead and their images
   # would otherwise all be tagged ":unknown".
@@ -128,8 +146,27 @@ build_engine() {
   case "$base" in
     mariadb)  bargs+=(--build-arg "MARIADB_TAG=${tag}") ;;
     alisql)   bargs+=(--build-arg "ALISQL_TAG=${tag}") ;;
+    # The value is a SHA rather than a tag name -- Percona is pinned to a
+    # commit (the tip of Percona PR #6278 on base `9.7`), not to a release --
+    # but it travels by the same `source.tag` key and through the same build
+    # arg, because `git archive` and `docker build --build-arg` neither know
+    # nor care which it is. docker/percona/Dockerfile declares `ARG PERCONA_TAG` to receive it.
+    percona)  bargs+=(--build-arg "PERCONA_TAG=${tag}") ;;
     pgvector) bargs+=(--build-arg "PGVECTOR_TAG=${tag}") ;;
-    # Nothing compiled: the module is copied out of its own published image.
+    # The MyVector plugin commit (the value of `source.tag`) plus the MySQL
+    # server tag it is compiled into; both land in the image's environment and
+    # the manifest's source record. docker/myvector/Dockerfile declares both.
+    myvector) bargs+=(--build-arg "MYVECTOR_TAG=${tag}"
+                      --build-arg "MYSQL_SERVER_TAG=$(yq_get "$cfg" source.server_tag unknown)") ;;
+    # The server and the extension are both compiled from source. The
+    # vsql_vector commit (the value of `source.tag`) plus the
+    # villagesql-server tag it is compiled against; docker/villagesql/
+    # Dockerfile declares both. `villagesql84` arrives here through its
+    # `alias_of`, with its own server_tag; its images are named apart in its
+    # config because this tag, the extension commit, is the same in both.
+    villagesql) bargs+=(--build-arg "VILLAGESQL_TAG=${tag}"
+                        --build-arg "VILLAGESQL_SERVER_TAG=$(yq_get "$cfg" source.server_tag unknown)"
+                        --build-arg "VB_ENGINE_NAME=${engine}") ;;
     mongodb)  bargs+=(--build-arg "MONGOT_IMAGE=$(yq_get "$cfg" source.mongot_image "")") ;;
     # Nothing compiled: installed from a Percona repository. The package list
     # comes from the config, so a name that does not resolve is one edit away
@@ -179,17 +216,41 @@ open(out, "a").write("\n")
 PY
 }
 
+build_webui() {
+  # Not an engine: no source tree, no -march, no config/engines entry. Built
+  # from docker/webui with the repo excluded, since the repo is bind-mounted at
+  # run time rather than copied in.
+  info "building vector-bench/webui"
+  docker build --tag vector-bench/webui:latest "$VB_DOCKER/webui"
+  ok "vector-bench/webui:latest"
+}
+
 case "$ENGINE" in
   # `all` stays the three baseline engines. Extra versions such as mariadb123
   # are opt-in, because each is another hour of compiling that nobody asked for
   # by typing "all".
   all)        build_engine mariadb; build_engine alisql; build_engine pgvector ;;
+  webui)      build_webui ;;
   mariadb123) build_engine mariadb123 ;;
   # Nothing is compiled: the runtime image is the published PSMDB image plus
   # mongot copied out of its own image, both pinned by digest.
   mongodb)    build_engine mongodb ;;
   # Installed from Percona's valkey repository; nothing is compiled.
   valkey)     build_engine valkey ;;
+  # Percona SERVER, compiled from source like mariadb and alisql and not from
+  # a package like the two above. Opt-in rather than part of `all` for the
+  # same reason mariadb123 is: it is another full MySQL build that nobody
+  # asked for by typing "all".
+  percona)    build_engine percona ;;
+  # MySQL 9.7 compiled from source with the MyVector plugin in-tree. Opt-in
+  # for the same reason percona is: another full MySQL build.
+  myvector)   build_engine myvector ;;
+  # VillageSQL compiled from source plus the vsql_vector extension. Opt-in
+  # for the same reason: another full MySQL-sized build.
+  villagesql) build_engine villagesql ;;
+  # The same extension on VillageSQL's MySQL 8.4 server line, through the
+  # same Dockerfile (`alias_of: villagesql`). Opt-in for the same reason.
+  villagesql84) build_engine villagesql84 ;;
   mariadb|alisql|pgvector) build_engine "$ENGINE" ;;
   *) die "unknown engine: $ENGINE" ;;
 esac

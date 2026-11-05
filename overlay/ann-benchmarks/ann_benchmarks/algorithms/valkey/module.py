@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 import numpy
 
 from ..base.module import BaseANN
+from ...vb_warmup import IndexWarmupMixin
 
 try:  # pragma: no cover - exercised only inside the bench image
     import valkey as valkey_client
@@ -75,7 +76,26 @@ def _client(**kwargs):
     return factory(host="localhost", port=PORT, **kwargs)
 
 
-class ValkeySearch(BaseANN):
+
+def hdf5_safe(values):
+    """Drop what ann-benchmarks cannot store as an HDF5 attribute.
+
+    store_results writes every key of get_additional() straight into
+    f.attrs[k]. A None has no HDF5 type, and the failure lands at the very end,
+    after the entire sweep has run:
+
+        TypeError: Object dtype dtype('O') has no native HDF5 equivalent
+
+    ann-benchmarks catches it per worker and exits zero, so the phase reports
+    completed and writes no results at all. Four runs of Percona Search failed
+    that way, in smoke and at full scale alike, because ef_construction is
+    genuinely not applicable to mongot and None was the honest thing to put
+    there. Absent is the representable way to say the same thing.
+    """
+    return {k: v for k, v in values.items() if v is not None}
+
+
+class ValkeySearch(IndexWarmupMixin, BaseANN):
     def __init__(self, metric: str, method_param: Dict[str, Any]):
         if valkey_client is None:
             raise RuntimeError(
@@ -173,6 +193,7 @@ class ValkeySearch(BaseANN):
     # ------------------------------------------------------------------
 
     def fit(self, X: numpy.ndarray) -> None:
+        self._keep_warmup_sample(X)
         dim = int(X.shape[1])
         self._dim = dim
         self._probe = X[0]
@@ -382,6 +403,7 @@ class ValkeySearch(BaseANN):
         self._ef_runtime = int(ef_runtime)
         if self._query_verified is None:
             self._query_verified = self._verify_query()
+        self._warm_index_once()   # once per built index; see vb_warmup.py
         self._warm_cache()
 
     def _search(self, conn, vector, k: int) -> List[int]:
@@ -473,7 +495,7 @@ class ValkeySearch(BaseANN):
         return self._index_bytes / 1024.0
 
     def get_additional(self) -> Dict[str, Any]:
-        return {
+        return hdf5_safe({
             "engine": "valkey",
             "resource_pass": os.environ.get("VB_RESOURCE_PASS", "unknown"),
             "engine_version": self._server_version(),
@@ -497,7 +519,8 @@ class ValkeySearch(BaseANN):
             # versions are the provenance instead.
             "march": "none",
             "packages": self._packages(),
-        }
+            **self._warmup_attrs(),
+        })
 
     def _server_version(self) -> str:
         try:

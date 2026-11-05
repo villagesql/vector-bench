@@ -13,37 +13,34 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import sys
-from typing import Any, Dict, List, Optional
-
-import yaml
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import docker_ctl
-from .config import ResolvedResources, server_args
+from . import engines as engines_mod
+from .ann_knobs import (VILLAGESQL_ENGINES, efc_run_groups, excluded_builds,
+                        knob_problems, restrict_to_builds)
+from .config import ResolvedResources, server_args, server_env
 
-# Constructor class names, as ann-benchmarks expects them in config.yml.
-CONSTRUCTORS = {"mariadb": "MariaDB", "mariadb123": "MariaDB123",
-                "alisql": "AliSQL", "pgvector": "PGVector",
-                "mongodb": "PerconaSearch", "valkey": "ValkeySearch"}
+# Re-exported, not just imported: `cli.py` and a dozen tests reach these
+# through `ann_pass`, and the split that moved them into their own module is
+# about where the code lives, not about who may call it. `render_config`
+# deliberately stayed here -- docs/09 §4.10 is a historical record of the
+# Percona addition carrying ten line citations into it, and moving the
+# function would have falsified the section rather than updated it.
+from .ann_config import (  # noqa: F401
+    config_path,
+    expected_result_count,
+    expected_results,
+    read_config,
+    result_stem,
+    result_stems,
+    write_config,
+)
 
-# Where each engine's data directory lives inside its image. The ops path
-# mounts a volume here; the ann path binds a host directory for the same reason.
-DATA_MOUNT = {
-    "mariadb": "/var/lib/vbench",
-    "mariadb123": "/var/lib/vbench",
-    "alisql": "/var/lib/vbench",
-    "pgvector": "/var/lib/postgresql",
-    # Both processes write under one root: mongod's dbpath and mongot's Lucene
-    # segments. Sizing the index means reading mongot's directory, because
-    # collStats cannot see another process's files.
-    "mongodb": "/var/lib/vbench",
-    # Nothing durable is written, but the server still wants a working
-    # directory and the mount keeps the container's layout uniform.
-    "valkey": "/var/lib/vbench",
-}
 
-# ann-benchmarks raises this when every configuration is already done.
+# ann-benchmarks raises this when a run has no definitions left. NOT only when
+# everything is already done -- see the handling in `run_engine`.
 # See ann_benchmarks/main.py: `raise Exception("Nothing to run")`.
 NOTHING_TO_RUN = "Nothing to run"
 
@@ -53,10 +50,24 @@ MARIADB_ENGINES = ("mariadb", "mariadb123")
 
 
 # Bump when the measurement path itself changes in a way that makes older
-# numbers non-comparable, even at an identical resource configuration. Adding
-# the per-configuration warmup was such a change: without it the first
-# ef_search point paid for a cold cache and landed below the second.
-ANN_MEASUREMENT_VERSION = 2
+# numbers non-comparable, even at an identical resource configuration. It is
+# part of `ann_fingerprint`, so a bump moves EVERY pass's results tree and
+# forces every recall point of every engine to be measured again -- which is
+# the intent when it is bumped, and the reason it is not the remedy for a
+# single engine's re-pin (CLAUDE.md, the ann results tree invariant).
+#
+# History:
+#   2 -- the per-configuration `_warm_cache` (30 random-vector queries): without
+#        it the first ef_search point paid for a cold cache and landed below
+#        the second.
+#   3 -- the one-time index warm-up (overlay/.../vb_warmup.py): training-set
+#        queries before the first configuration on each built index until two
+#        consecutive 200-query batches agree within 5%, capped at 5,000. Thirty
+#        queries had not been enough: full-20260825 (tuned-complete, dbpedia
+#        1M x 1536) still measured ef_search 10 slower than 20 on all six
+#        MariaDB/AliSQL curves (1.69x-2.13x) and on both Percona Search curves
+#        (1.13x). A curve measured at 2 has that cold first point in it.
+ANN_MEASUREMENT_VERSION = 3
 
 
 def ann_fingerprint(resolved: Any) -> str:
@@ -127,6 +138,22 @@ def annb_results_dir(paths: Dict[str, str], resource_pass: str,
     return path
 
 
+def ann_m_values(engine: str, profile: Dict[str, Any],
+                 resources: Dict[str, Any], resource_pass: str) -> List[int]:
+    """The M values the ann phase builds for `engine`, in this pass.
+
+    The tuned pass's `resources.extras.m_values_by_engine` first, then the
+    profile's `ann.m_values_by_engine`, then `ann.m_values`. One function so
+    the ann render and `cli._memory_refusal` -- which must estimate the same
+    graphs the ann phase will build -- cannot read the grid two ways.
+    """
+    ann = profile.get("ann", {}) or {}
+    by_engine = ((resources.get("extras", {}) or {}).get("m_values_by_engine")
+                 if resource_pass == "tuned" else None) or \
+                ann.get("m_values_by_engine") or {}
+    return list(by_engine.get(engine) or ann.get("m_values", [16]))
+
+
 def render_config(engine: str, profile: Dict[str, Any],
                   resources: Dict[str, Any], resource_pass: str) -> Dict[str, Any]:
     """Build the ann-benchmarks config.yml body for one engine and profile.
@@ -136,11 +163,24 @@ def render_config(engine: str, profile: Dict[str, Any],
     performance difference and would not be one.
     """
     ann = profile.get("ann", {}) or {}
-    m_values = list(ann.get("m_values", [16]))
+    # Graph degree is the only build knob MHNSW and VIDX expose, and at M=16
+    # their lowest query effort already returns recall 0.97-0.98. So they have
+    # no measurement anywhere near the 0.90 floor the headline table reports at,
+    # while pgvector and Valkey -- which have ef_construction as well -- reach
+    # down to 0.76. Sweeping M only where it is the sole knob costs a reload
+    # per value on the engines that need it and nothing on the engines that do
+    # not, and it turns three daggered cells into real measurements.
+    m_values = ann_m_values(engine, profile, resources, resource_pass)
     query_args = [list(ann.get("ef_search", [10, 40, 160]))]
     extras = (resources.get("extras", {}) or {}) if resource_pass == "tuned" else {}
 
     run_groups: Dict[str, Any] = {}
+
+    # Refused, never clamped -- see orchestrator/ann_knobs.py. M is checked
+    # here for every engine; ef_construction in each branch that reads it.
+    problems = knob_problems(engine, m_values)
+    if problems:
+        raise ValueError("; ".join(problems))
 
     if engine in MARIADB_ENGINES + ("alisql",):
         if engine in MARIADB_ENGINES:
@@ -168,16 +208,13 @@ def render_config(engine: str, profile: Dict[str, Any],
             # hand pgvector a tuning axis the others lack.
             ef_constructions = [int(ann.get("pgvector_ef_construction", 200))]
 
+        _refuse_efc(engine, m_values, ef_constructions)
         for build_mode in ann.get("pgvector_build_modes", ["post"]):
-            run_groups[f"{build_mode}_build"] = {
-                "arg_groups": [{
-                    "M": m_values,
-                    "efConstruction": ef_constructions,
-                    "build_mode": build_mode,
-                }],
-                "args": {},
-                "query_args": query_args,
-            }
+            run_groups.update(efc_run_groups(f"{build_mode}_build", {
+                "M": m_values,
+                "efConstruction": ef_constructions,
+                "build_mode": build_mode,
+            }, engine, query_args))
     elif engine == "valkey":
         # The same two knobs pgvector has, so the same rule: pinned in the
         # normalized pass because MariaDB and AliSQL still lack ef_construction,
@@ -187,16 +224,126 @@ def render_config(engine: str, profile: Dict[str, Any],
         else:
             ef_constructions = [int(ann.get("valkey_ef_construction", 200))]
 
+        _refuse_efc(engine, m_values, ef_constructions)
         for build_mode in ann.get("valkey_build_modes", ["post"]):
-            run_groups[f"{build_mode}_build"] = {
-                "arg_groups": [{
-                    "M": m_values,
-                    "efConstruction": ef_constructions,
-                    "build_mode": build_mode,
-                }],
-                "args": {},
-                "query_args": query_args,
-            }
+            run_groups.update(efc_run_groups(f"{build_mode}_build", {
+                "M": m_values,
+                "efConstruction": ef_constructions,
+                "build_mode": build_mode,
+            }, engine, query_args))
+
+    elif engine == "percona":
+        # A branch of its own and NOT an addition to the MySQL-family
+        # condition above, because the thing this engine needs that branch
+        # cannot express is `efConstruction`. No MySQL-family branch emits it,
+        # because no other MySQL-family engine here exposes it: Percona has a
+        # build-time knob AND a query-time one (`innodb_hnsw_ef_search`),
+        # which makes it the only engine in this study with both.
+        #
+        # Pinned in the normalized pass for the same reason pgvector's and
+        # Valkey's are, and `percona/config.yml` says the same thing at
+        # length: MariaDB and AliSQL still lack the knob, and sweeping it
+        # where only one engine has it hands that engine a tuning axis the
+        # others cannot answer. Swept in the tuned pass, where following each
+        # vendor's own idioms is the point.
+        if resource_pass == "tuned" and extras.get("percona_ef_construction"):
+            ef_constructions = list(extras["percona_ef_construction"])
+        else:
+            ef_constructions = [int(ann.get("percona_ef_construction", 200))]
+
+        # `percona_build_modes` IS REFUSED RATHER THAN HONOURED, and this is
+        # the one place in the Percona addition where a documented intention
+        # could not be delivered.
+        #
+        # docs/09 §2.5 and §4.10 propose it: Percona maintains the graph on
+        # every INSERT *and* has a separable bulk path, so build mode is a
+        # within-engine comparison on a MySQL-family server -- which would
+        # separate "bulk is cheaper than incremental" from "Postgres differs
+        # from MySQL here", two claims that cannot be told apart while
+        # pgvector is the only engine with both modes and also the only
+        # Postgres. The ops harness can do it: `PerconaDriver.capabilities()`
+        # derives `incremental_index` from `IndexSpec.build_mode` and
+        # `create_schema`/`create_index` split accordingly.
+        #
+        # THE ANN PATH CANNOT, because the overlay module has no `build_mode`.
+        # `pgvector/module.py:76-78` and `valkey/module.py:110-112` each read
+        # it, validate it, branch on it in `fit` and report it back in
+        # `get_additional`; `percona/module.py` contains the string zero
+        # times, and so does the `VBMySQLBase` it inherits from. Emitting the
+        # key here anyway would produce two run groups, `post_build` and
+        # `incremental_build`, differing only in a `method_param` nothing
+        # reads -- two IDENTICAL curves under two labels, with no field in the
+        # record to say they were the same measurement. That is the shape this
+        # repo guards against everywhere else, and a loud refusal is the
+        # alternative it prefers.
+        modes = list(ann.get("percona_build_modes", ["post"]))
+        if modes != ["post"]:
+            raise ValueError(
+                "ann.percona_build_modes is not implemented: "
+                "overlay/.../algorithms/percona/module.py has no `build_mode`, "
+                "so every mode would build the index the same way and report "
+                f"identical curves under different labels. Got {modes!r}. The "
+                "ops harness does support it (PerconaDriver.capabilities), so "
+                "a build-mode comparison is available there today; the ann "
+                "half needs the overlay module to read `build_mode` the way "
+                "pgvector's and valkey's do.")
+
+        # One run group, matching `percona/config.yml`'s own `innodb` group
+        # and alisql's branch above rather than pgvector's: the vector index
+        # is InnoDB's, implemented in storage/innobase, so there is no second
+        # storage engine to curve against. `engine` is still passed rather
+        # than omitted, so a profile asking for something else gets a server
+        # error naming the engine instead of silently getting InnoDB.
+        _refuse_efc(engine, m_values, ef_constructions)
+        run_groups.update(efc_run_groups("innodb", {
+            "M": m_values,
+            "efConstruction": ef_constructions,
+            "engine": "InnoDB",
+        }, engine, query_args))
+
+    elif engine == "myvector":
+        # Percona's shape for the same reason: MyVector exposes a build-time
+        # effort knob (`ef=` in the column options, hnswlib's ef_construction)
+        # and a query-time one (`ef_search` per MYVECTOR_IS_ANN call), so it is
+        # pinned in the normalized pass and swept only where the tuned pass
+        # asks. 200 rather than the plugin's own default of 100, so that the
+        # normalized pass builds MyVector at the same ef_construction as
+        # pgvector, Valkey and Percona -- every engine that has the knob.
+        if resource_pass == "tuned" and extras.get("myvector_ef_construction"):
+            ef_constructions = list(extras["myvector_ef_construction"])
+        else:
+            ef_constructions = [int(ann.get("myvector_ef_construction", 200))]
+        # No build-mode axis anywhere: the overlay module and the ops driver
+        # both build after the load, which is the only build the engine has
+        # on this server (see `INCREMENTAL_DECLINED` in
+        # harness/drivers/myvector.py).
+        _refuse_efc(engine, m_values, ef_constructions)
+        run_groups.update(efc_run_groups("innodb", {
+            "M": m_values,
+            "efConstruction": ef_constructions,
+        }, engine, query_args))
+
+    elif engine in VILLAGESQL_ENGINES:
+        # Both VillageSQL server lines, one extension: the same grid and the
+        # same `villagesql_ef_construction` key, so a profile cannot build the
+        # 8.4 graph at a different ef_construction from the 9.7 one.
+        # MyVector's shape: a build-time knob (`ef_construction` in the index
+        # options) and a query-time one (`vsql_vector.ef_search`). Pinned in
+        # the normalized pass at the value every engine with the knob is built
+        # at, swept only where the tuned pass asks. The extension refuses
+        # ef_construction < M and > 32 x M, so those combinations are dropped
+        # by name (`ann_knobs.excluded_builds`), never clamped. One build
+        # mode: the module declares the index in CREATE TABLE and the load
+        # builds it (`capabilities.bulk_vector_index_build: false`).
+        if resource_pass == "tuned" and extras.get("villagesql_ef_construction"):
+            ef_constructions = list(extras["villagesql_ef_construction"])
+        else:
+            ef_constructions = [int(ann.get("villagesql_ef_construction", 200))]
+        _refuse_efc(engine, m_values, ef_constructions)
+        run_groups.update(efc_run_groups("innodb", {
+            "M": m_values,
+            "efConstruction": ef_constructions,
+        }, engine, query_args))
 
     elif engine == "mongodb":
         # Quantization is the one axis no other engine has, so it follows the
@@ -223,11 +370,17 @@ def render_config(engine: str, profile: Dict[str, Any],
     else:
         raise ValueError(f"unknown engine: {engine}")
 
+    # A stage-2 selection names its builds exactly (`select-builds`); see
+    # `ann_knobs.restrict_to_builds` for why the lists alone were not enough.
+    selected = (extras.get("ann_builds_by_engine") or {}).get(engine)
+    if selected:
+        run_groups = restrict_to_builds(engine, run_groups, selected)
+
     return {
         "float": {
             "any": [{
                 "base_args": ["@metric"],
-                "constructor": CONSTRUCTORS[engine],
+                "constructor": engines_mod.get(engine).ann_constructor,
                 "disabled": False,
                 "docker_tag": f"vector-bench/{engine}-bench",
                 "module": f"ann_benchmarks.algorithms.{engine}",
@@ -238,18 +391,40 @@ def render_config(engine: str, profile: Dict[str, Any],
     }
 
 
-def write_config(work_dir: str, engine: str, body: Dict[str, Any]) -> str:
-    """Write the rendered config into the disposable ann-benchmarks working copy."""
-    path = os.path.join(work_dir, "ann_benchmarks", "algorithms", engine, "config.yml")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    header = (
-        f"# GENERATED by vector-bench for engine '{engine}'. Do not edit.\n"
-        f"# Regenerate with: ./run-benchmark.sh render --profile <name>\n"
-    )
-    with open(path, "w") as fh:
-        fh.write(header)
-        yaml.safe_dump(body, fh, sort_keys=False, default_flow_style=False)
-    return path
+def excluded_ann_builds(engine: str, profile: Dict[str, Any],
+                        resources: Dict[str, Any], resource_pass: str
+                        ) -> List[Tuple[int, int, str]]:
+    """(M, ef_construction, reason) for each build the profile's grid names
+    and `render_config` left out because the engine cannot build it.
+
+    Read back from the render rather than re-derived, so the list printed
+    before a run is the list the container will not be asked for.
+    """
+    body = render_config(engine, profile, resources, resource_pass)
+    m_values: List[int] = []
+    efcs: List[int] = []
+    for algorithm in body["float"]["any"]:
+        for run_group in algorithm["run_groups"].values():
+            for group in run_group["arg_groups"]:
+                if "efConstruction" not in group:
+                    return []
+                for m in group["M"]:
+                    if int(m) not in m_values:
+                        m_values.append(int(m))
+                for efc in group["efConstruction"]:
+                    if int(efc) not in efcs:
+                        efcs.append(int(efc))
+    return excluded_builds(engine, m_values, efcs)
+
+
+def _refuse_efc(engine: str, m_values: List[int],
+                ef_constructions: List[int]) -> None:
+    """`knob_problems` for ef_construction, raised as `render_config` does
+    for M. Combinations legal value-by-value but not together are dropped by
+    `efc_run_groups` instead, and named by `ann_knobs.excluded_builds`."""
+    problems = knob_problems(engine, (), ef_constructions)
+    if problems:
+        raise ValueError("; ".join(problems))
 
 
 # In the ann pass the database server and the ann-benchmarks client share one
@@ -327,8 +502,20 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     # Each configuration builds a fresh index, so the directory is cleared
     # rather than reused; leaving it would also make the ingest measurement
     # depend on whatever the previous run left behind.
+    #
+    # Cleared through `remove_tree_as_root`, as the ops pass clears its own: the
+    # engine writes this directory as root from inside the container, so a
+    # plain `shutil.rmtree(..., ignore_errors=True)` running as the host user
+    # removed nothing and said nothing, and the next run started on the
+    # previous run's datadir. With a server binary newer than the one that
+    # wrote it, a data-dictionary upgrade guard then refuses to start
+    # ("Upgrading from a development version is not allowed") and every
+    # configuration of the sweep dies at startup.
     state_dir = os.path.join(paths["engine_state"], "annb", f"{resource_pass}-{engine}")
-    shutil.rmtree(state_dir, ignore_errors=True)
+    if not docker_ctl.remove_tree_as_root(state_dir, image):
+        print(f"[ann] WARNING: {state_dir} survived teardown (still root-owned); "
+              f"the next server starts on the previous run's datadir",
+              file=sys.stderr)
     os.makedirs(state_dir, exist_ok=True)
 
     command = [
@@ -359,18 +546,16 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             "VB_INSERT_THREADS": str(profile.get("ann", {}).get("insert_threads", 0)),
             "VB_RUN_ID": run_id,
             "VB_RESOURCE_PASS": resource_pass,
-            # See ops_pass: sized centrally so both measurement paths give
-            # mongot the same heap, and the single-process engines ignore it.
-            "VB_MONGOT_HEAP_GB": str(
-                max(1, resolved.mongot_heap_bytes // (1024 ** 3))),
-            "VB_MAXMEMORY_BYTES": str(resolved.maxmemory_bytes),
+            # Sized centrally so both measurement paths give mongot the same
+            # heap, and so `engines_resolved` records exactly this env.
+            **server_env(resolved),
             "PYTHONUNBUFFERED": "1",
         },
         volumes=[
             f"{paths['work_annb']}:/home/app:rw",
             f"{paths['datasets']}:/home/app/data:rw",
             f"{annb_results_dir(paths, resource_pass, resolved)}:/home/app/results:rw",
-            f"{state_dir}:{DATA_MOUNT[engine]}:rw",
+            f"{state_dir}:{engines_mod.get(engine).data_mount}:rw",
         ],
         command=command,
         detach=False,
@@ -396,7 +581,14 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
         )
 
     results_dir = annb_results_dir(paths, resource_pass, resolved)
+    pruned = prune_empty_results(results_dir, image)
+    if pruned:
+        print(f"[ann] discarded {pruned} result file(s) that contain no "
+              f"measurements; those configurations will be recomputed")
     before = _count_results(results_dir, engine, dataset)
+    # What the rendered config asks for, so a sweep that stopped half way can
+    # be told from one that finished. See the shortfall check at the end.
+    expected = expected_results(paths["work_annb"], engine)
 
     # Warn before the fact, not after. ann-benchmarks signals "everything is
     # already done" by raising and printing a full traceback, which is
@@ -404,14 +596,39 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     if before and not force:
         print(f"[ann] {before} existing result file(s) for {engine} / "
               f"{dataset}; already-computed configurations will be skipped")
+    # The ops path has sampled its server all along; the ann path sampled
+    # nothing, which is why three contaminated recall points had to be
+    # identified five days later from a latency ratio rather than read off a
+    # graph. The series carries host load alongside the container's own usage,
+    # so a phase measured under someone else's job says so.
+    memory_timeseries = os.path.join(
+        paths["run_dir"],
+        f"mem-{engine}-{dataset}-{resource_pass}-ann.jsonl")
+    sampler = docker_ctl.MemorySampler(
+        container, memory_timeseries, wait_for_start_s=120.0)
+    sampler.start()
+
     output: List[str] = []
-    rc = docker_ctl.run_foreground(
-        spec, timeout=timeout_s, sink=output,
-        # Only filter when a benign traceback is actually possible.
-        line_filter=_SuppressNothingToRun() if (before and not force) else None,
-    )
+    try:
+        rc = docker_ctl.run_foreground(
+            spec, timeout=timeout_s, sink=output,
+            # Only filter when a benign traceback is actually possible.
+            line_filter=_SuppressNothingToRun() if (before and not force) else None,
+        )
+    finally:
+        sampler.stop()
+        if sampler.samples:
+            print(f"[ann] captured {sampler.samples} resource samples -> "
+                  f"{os.path.basename(memory_timeseries)}")
     after = _count_results(results_dir, engine, dataset)
     text = "\n".join(output)
+
+    # Kept beside the measurements. A phase that writes no results explains
+    # itself here and nowhere else, and a terminal is not an archive.
+    saved = docker_ctl.save_phase_log(
+        paths["run_dir"], engine, dataset, "ann", resource_pass, output)
+    if saved:
+        print(f"[ann] log -> {os.path.relpath(saved, paths['run_dir'])}")
 
     # ann-benchmarks treats "every configuration already has results" as an
     # error: main() raises Exception("Nothing to run") and the process exits
@@ -419,7 +636,22 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     # point of leaving the results tree in place between runs. Recognise it
     # rather than reporting three healthy engines as broken.
     if rc != 0 and NOTHING_TO_RUN in text:
-        if after > 0:
+        # GATED ON THE SAME EXPECTATION AS THE CLEAN-EXIT PATH BELOW, because
+        # "Nothing to run" does NOT mean "every configuration is done". It
+        # means the definition list was empty by the time main() looked, and
+        # already-done is only one of the ways that happens. The other one
+        # matters here: in --local mode `check_module_import_and_constructor`
+        # drops a definition whose module will not import with a logged
+        # warning and no raise (NO_MODULE; a missing *constructor* does raise),
+        # and the already-run filter runs BEFORE it. So a shared tree holding
+        # 16 of 24 plus a bench image whose algorithm module lost a dependency
+        # in a rebuild gives: 8 definitions survive the resume filter, all 8
+        # are dropped for the import, the list is empty, main() raises.
+        # Reading that as success checkpointed the phase, --resume never came
+        # back, and the report carried 16 of 24 curves -- which is exactly the
+        # defect the shortfall check below exists to prevent, one branch away
+        # from it.
+        if after > 0 and (not expected or after >= expected):
             print(
                 f"[ann] nothing to do: all {after} configuration(s) for "
                 f"{engine} / {dataset} already have results in {results_dir}. "
@@ -427,9 +659,16 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             )
             return 0
         print(
-            f"[ann] FAILED: ann-benchmarks had nothing to run and there are no "
-            f"existing results in {results_dir}. The rendered config matched no "
-            f"definitions, or the algorithm module failed to import.",
+            f"[ann] FAILED: ann-benchmarks had nothing to run, and "
+            f"{results_dir} holds {after} result file(s)"
+            + (f" where the rendered config asks for {expected}."
+               if expected else " and the rendered config could not be read.")
+            + f"\n[ann] Either the config matched no definitions, or the "
+            f"algorithm module failed to import and every remaining "
+            f"definition was silently dropped -- ann-benchmarks logs that as a "
+            f"warning and then reports having nothing to run. Look for "
+            f"'could not be loaded; skipping' in the log saved beside the "
+            f"measurements.",
             file=sys.stderr,
         )
         return 1
@@ -472,6 +711,43 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             )
         return 1
     if rc == 0:
+        # THE SHORTFALL TEST COMES FIRST, before anything is reported as done.
+        # Reporting "nothing to do: all 16 configuration(s) already have
+        # results" and then "FAILED: 16 of 24" on the next line, at the end of
+        # a seven-hour phase, is a log that argues with itself.
+        #
+        # A PARTIAL SWEEP IS NOT A COMPLETE ONE, and until this check it was
+        # recorded as one: the case above catches the total loss
+        # (`after == 0`) and nothing caught the partial, because `after`
+        # against `before` cannot see it.
+        #
+        # Measured, in run full-20261015-215006: the gist-960 normalized ANN
+        # phase ran 7 h 46 m, lost its M=8 curve to
+        # `mariadb.InterfaceError: Server has gone away` during the parallel
+        # load, wrote 16 of the 24 files the config asks for, exited 0, and was
+        # checkpointed as `normalized/percona/gist-960-euclidean/ann` -- so
+        # `--resume` will never retry it and the lost curve is
+        # indistinguishable in the report from a curve nobody asked for.
+        #
+        # `after > expected` is deliberately NOT a failure: the results tree
+        # is shared across runs and keyed only by the resource configuration,
+        # so a wider grid measured earlier at the same budget is legitimately
+        # still in it.
+        if expected and after < expected:
+            print(
+                f"[ann] FAILED: {engine} / {dataset} exited 0 with {after} of "
+                f"{expected} result file(s) in {results_dir} -- "
+                f"{expected - after} short.\n"
+                f"[ann] ann-benchmarks runs each definition in a forked worker "
+                f"and does not check its exit code, so a configuration that "
+                f"died mid-sweep exits 0 and looks complete. Failing the phase "
+                f"is what keeps it out of the checkpoints and brings --resume "
+                f"back for it; the worker's traceback is in the log saved "
+                f"beside the measurements.",
+                file=sys.stderr,
+            )
+            return 1
+
         if after == before:
             print(f"[ann] nothing to do: all {after} configuration(s) for "
                   f"{engine} / {dataset} already have results "
@@ -517,6 +793,86 @@ class _SuppressNothingToRun:
                 held, self._held = self._held, None   # some other error: show it
                 return held
         return []
+
+
+# store_results() opens the file, writes the attributes, and only then creates
+# the datasets:
+#
+#     with h5py.File(filename, "w") as f:
+#         for k, v in attrs.items():
+#             f.attrs[k] = v
+#         times = f.create_dataset("times", ...)
+#
+# An attribute h5py cannot represent therefore leaves a syntactically valid
+# HDF5 file holding no measurements at all -- and ann-benchmarks decides what
+# to skip with os.path.exists(). One `"ef_construction": None` in a module's
+# get_additional() was enough to make Percona Search write a stub for every
+# ef_search it reached, and each subsequent run then skipped that point as
+# already done. Four attempts later its recall curve was two points at the top
+# of the sweep, and the six below them could not be recomputed by re-running:
+# the stubs outlived the bug that made them.
+#
+# The modules no longer emit unwritable attributes, but a stub is permanent
+# once written, so the ones already on disk have to go. h5py is not installed
+# on the host -- deliberately, see client_memory_bytes -- so the check runs in
+# the image that has it.
+_PRUNE_SCRIPT = """
+import os, sys
+import h5py
+
+removed = 0
+for base, _dirs, files in os.walk("/results"):
+    for name in files:
+        if not name.endswith(".hdf5"):
+            continue
+        path = os.path.join(base, name)
+        try:
+            with h5py.File(path, "r") as fh:
+                intact = "times" in fh and "neighbors" in fh
+        except Exception:
+            intact = False
+        if not intact:
+            try:
+                os.remove(path)
+                removed += 1
+                print("pruned " + path, file=sys.stderr)
+            except OSError:
+                pass
+print(removed)
+"""
+
+
+def prune_empty_results(results_dir: str, image: str) -> int:
+    """Delete result files that hold no measurements, and count them.
+
+    Returns 0 rather than raising if the check itself cannot run: this exists
+    to stop a stale stub from silently suppressing a configuration, and failing
+    the run over it would be a worse trade than leaving it in place, where at
+    least the report's own empty-curve warning still fires.
+    """
+    output: List[str] = []
+    spec = docker_ctl.ContainerSpec(
+        name=f"vb-prune-{os.getpid()}",
+        image=image,
+        entrypoint="python3",
+        command=["-c", _PRUNE_SCRIPT],
+        volumes=[f"{results_dir}:/results:rw"],
+        detach=False,
+        network="none",
+    )
+    try:
+        rc = docker_ctl.run_foreground(spec, timeout=300, stream=False,
+                                       sink=output)
+    except docker_ctl.DockerError:
+        return 0
+    if rc != 0:
+        return 0
+    for line in reversed(output):
+        try:
+            return int(line.strip())
+        except ValueError:
+            continue
+    return 0
 
 
 def _count_results(results_dir: str, engine: str, dataset: str) -> int:

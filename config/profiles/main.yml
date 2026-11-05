@@ -16,9 +16,24 @@
 #   * concurrency to 32 clients — the smoke run's most striking result was
 #                                MariaDB saturating at 2 clients; this is where
 #                                that gets confirmed or overturned.
-#   * filtered starts at 10%    — 1% selectivity measured 0.9 QPS on MariaDB,
-#                                so 2000 queries there costs 37 minutes per
-#                                configuration for one point on a curve.
+#   * each point three times     — 6 points x 30 s x 3 is ~9 minutes per
+#                                engine-dataset pair plus warm-up, which buys
+#                                an error bar on the one measurement here that
+#                                has been seen to move 21% between windows.
+#   * filtered at 1/10/50%      — 1% is back. It measured 0.9 QPS on MariaDB
+#                                against 326 unfiltered, so 2000 queries there
+#                                cost 37 minutes for one point; what makes it
+#                                affordable now is `filtered_budget_s`, which
+#                                caps every point at five minutes and records
+#                                what it managed instead of running until it
+#                                finishes. The low-selectivity case is where
+#                                pre-filtering, post-filtering and index
+#                                iteration actually diverge, so omitting it
+#                                dropped the measurement this dimension is for.
+#   * both filter columns        — `tag` and `ctag`, which doubles the number
+#                                of filtered points. `ctag` follows the vector
+#                                space, so it is the one that shows an engine
+#                                abandoning a query; `tag` is the control.
 #   * fewer filtered queries    — 500, not 2000. At sub-1 QPS the query count
 #                                is the whole cost.
 name: main
@@ -30,13 +45,76 @@ datasets:
 
 k: 10
 runs: 2
+# Publishable: a report is written from this profile, so it measures every
+# ann point at least twice (`runs: 2`). With one run, the first configuration
+# of every sweep was a single draw on a cold index -- full-20260825 (a
+# tuned-complete run at `runs: 1`) published
+# ef_search 10 slower than ef_search 20 on every MySQL-family curve -- and
+# tests/test_config.py refuses `runs < 2` on any profile marked publishable.
+publishable: true
 
 ann:
   enabled: true
   # M=32 is where the high-recall end of the frontier lives and it is also
   # ~65% of the grid's load cost. Keep it; drop the middle instead if you need
   # to cut further.
-  m_values: [8, 32]
+  #
+  # **M=16 is here for PR 5 §5.2, not for the frontier**, and it is the one
+  # value in this grid whose job is a cross-check rather than a measurement.
+  # `ops.m_values` below is [16], and §5.2 matches an ops calibration point to
+  # an ann recall point at the same M -- so without a 16 here the two paths
+  # never meet on this profile and the report's "Consistency checks" section
+  # is empty by construction. Surveyed across every shipped profile at the
+  # time: `main` was the ONLY one whose grids did not meet. `full` and `quick`
+  # sweep [8, 16, 32] against ops [16]; `smoke`, `tuned-complete`,
+  # `mariadb-blog` and `mariadb-blog-repro` pin [16] on both sides; `dev` runs
+  # no ann phase and `m-sweep` no ops phase.
+  #
+  # **So the choice was not about feasibility -- it was about which run the
+  # check lands on.** §5.2 item 4's second option, calibration at the ann M
+  # values in a separate `--crosscheck` profile, costs nothing and needs no
+  # code at all: `ops.m_values` is a plain per-profile list
+  # (`cli.py`: `m_values = list(ops_cfg.get("m_values", [16]))`), with no
+  # dataset axis anywhere near it, so that option is one new YAML file. What
+  # it buys is a consistency check on a profile nobody publishes from. `main`
+  # is the profile the report comes from, and a cross-check that never runs
+  # beside the numbers it is checking is not a cross-check. That is what the
+  # extra reload is being spent on.
+  #
+  # The per-dataset obstacle belongs to item 4's FIRST option, not the
+  # second: restricting M=16 to sift-128 alone would halve the cost and needs
+  # an `m_values_by_dataset` axis that does not exist --
+  # `ann_pass.render_config` takes no `dataset` argument at all, and
+  # `estimate.estimate_load_hours` reads one global `len(ann.m_values)` for
+  # every dataset, so the printed figure would be wrong too.
+  #
+  # It costs a full reload of both corpora per engine: +17.04 h of ingest for
+  # the three headline engines and +25.13 h for all seven, by
+  # `orchestrator/estimate.py`. Restricting it to sift-128 alone would have
+  # added about half as much instead: +8.12 h and +11.72 h.
+  # (The all-engine figure was +23.29 h while it covered only "the six with
+  # a measured ingest rate" -- Percona's was unmeasured, so the estimator
+  # named it rather than modelling it. Its M=16 rate is in the table now.)
+  #
+  # **The "~65%" above is the share over THIS grid, and that is worth saying
+  # now that the grid has three values again.** docs/07's "The cost rises
+  # steeply with M" measures MariaDB on glove-100 at ~320 rows/s for M=8,
+  # ~200 for M=16 and ~70 for M=32 -- 1.03 h, 1.64 h and 4.70 h -- so M=32 is
+  # 64% of the [8, 16, 32] grid. Over the [8, 32] grid this profile ran until
+  # now it was 82%, and reading the sentence against that grid is what makes
+  # it look wrong. It is not.
+  #
+  # **The printed estimate is high on this change and low on the total**, and
+  # both directions come from one simplification: `estimate.py` charges every
+  # M value the same reload at one rate per engine, 147 rows/s for MariaDB on
+  # glove-100, which its own comment states is the observed *mid-grid*
+  # number. M=16 is the cheap middle of the grid, measured at ~200 rows/s, so
+  # the extra M really costs ~1.6 h there against the ~2.2 h charged -- the
+  # estimate is about a third high on the marginal M. The same flat rate sums
+  # to ~6.7 h for three loads where the measured per-M times sum to ~7.4 h,
+  # about 9% low on the total. Plan against the printed figure: for the
+  # decision this comment is about, it is the conservative one.
+  m_values: [8, 16, 32]
   ef_search: [10, 20, 40, 80, 160, 320]
   pgvector_ef_construction: 200
   pgvector_build_modes: [post, incremental]
@@ -54,11 +132,77 @@ ops:
   subset_rows: null
   load_threads: 1
   max_queries: 500
-  client_counts: [1, 2, 4, 8, 16, 32]
+  # The 2-client point was dropped on 2026-10-14 and the reason is structural,
+  # not a matter of taste. The concurrency status is refused when the achieved
+  # fraction of the client count falls below SERVED_CONCURRENCY_FLOOR = 0.5
+  # (harness/metrics/latency.py), and BOTH estimators of that fraction --
+  # served_concurrency/clients and the scaling efficiency -- equal exactly
+  # 1/n for a perfectly serialized pool. At n=2 that is 0.5 exactly, against
+  # a strict `<`, so a two-client pool that genuinely took turns lands on
+  # whichever side of the floor the box's noise puts it: measured 0.499
+  # (refused) under one synthetic driver and 0.537 (published as ok) under
+  # another, for the same defect. Every other point in the grid decides
+  # cleanly -- at n=4 serialization reads 0.25 against 0.98 for a pool that
+  # scaled. The point cost 30s x 3 repeats per ops unit and could not answer
+  # the question it was there to answer.
+  #
+  # It is kept in mariadb-blog.yml and mariadb-blog-repro.yml, where the
+  # 2-client QPS is a figure being compared against a published curve rather
+  # than a concurrency verdict. See
+  # tests/test_two_client_points_are_not_measured.py, which encodes exactly
+  # that split.
+  client_counts: [1, 4, 8, 16, 32]
   concurrency_duration_s: 30
-  # 1% is deliberately absent: it cost 37 minutes per configuration on MariaDB
-  # at 0.9 QPS. Measure it separately with --profile full if the low-selectivity
-  # case matters to you.
-  selectivities: [0.10, 0.50]
+  # Three windows per point, and the median reported with the spread beside
+  # it. Every figure in this framework was a single sample until a Valkey
+  # point was re-measured by accident, five hours later on the same build and
+  # configuration, and came back 21% higher at sixteen and thirty-two clients.
+  # Concurrency is the headline finding, the noisiest measurement here, and
+  # the cheapest to repeat: 6 points x 30 s x 3 is 9 minutes per
+  # engine-dataset pair plus warm-up, against the ~51 h of ingest this
+  # profile pays before a single query runs. Two engines differing by less
+  # than the window-to-window spread were being presented as ordered.
+  #
+  # `concurrency_queries` is deliberately NOT set. It defaults to the whole
+  # test set (10,000 queries for both datasets here); setting it is the way
+  # BACK to a small pool, which measures every graph cache against a hot set
+  # it can hold entirely and erases the difference the concurrency chart
+  # exists to show. It exists for reproducing a pre-version-3 run, not for
+  # tuning this one.
+  concurrency_repeats: 3
+  # All three, 1% included. It was dropped because it cost 37 minutes per
+  # configuration on MariaDB at 0.9 QPS with nothing bounding the loop; the
+  # budget below is what bounds it, so the cost of the point is now five
+  # minutes whatever the engine does inside them and the record says how many
+  # of the 500 queries it managed. A truncated point is greyed out in the
+  # report rather than averaged in.
+  selectivities: [0.01, 0.10, 0.50]
+  # Five minutes per (column, selectivity, iterative-scan mode) point. The
+  # worst case this profile can reach per engine-dataset is 2 columns x 3
+  # selectivities x 300 s = 30 minutes at one mode, which is every engine but
+  # pgvector, and 60 minutes at pgvector's two -- against the ~51 h of ingest
+  # it pays before a single query runs. Without it the same grid was
+  # unbounded: the run estimate printed its shape and refused to call the
+  # total a ceiling, which is the honest thing to print and a bad thing to
+  # have to.
+  #
+  # Both modes, not one. `pgvector_iterative_scan` below declares two and
+  # `cli.py:_ops_iterative_scan` now passes both; the workload loops them
+  # against one already-loaded index, so the second mode costs this grid again
+  # and no ingest. `estimate.py:_filtered_search` carries the factor.
+  filtered_budget_s: 300
   churn_fractions: [0.10, 0.25]
+  # PR 4 §4.3. Readers querying the index while the churn writer re-inserts,
+  # so the churn section reports what a read costs under writes rather than
+  # what it costs in a maintenance window with nothing else touching the
+  # index. Stated rather than left to the harness default because this is the
+  # headline profile and the figure it publishes -- p99 under writes over
+  # baseline p99 -- is only interpretable beside the number of readers that
+  # produced it.
+  #
+  # The cost is a 30 s baseline reader window before each step's deletes, per
+  # churn fraction per ops unit; the readers themselves run concurrently with
+  # a re-insert that was going to happen anyway and add no wall clock of their
+  # own. `ops.churn_readers: 0` is the write-only pass.
+  churn_readers: 4
   pgvector_iterative_scan: [off, relaxed_order]

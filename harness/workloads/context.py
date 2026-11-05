@@ -37,6 +37,22 @@ class RunContext:
 
         Centralised so a new workload cannot accidentally omit the provenance
         that makes a number interpretable.
+
+        One piece of provenance is deliberately *not* here, and a reader
+        looking for it will look here first: `extra.ops_measurement_version`.
+        It cannot be, because this dict is splatted into `Record(**common,
+        ...)` and build, concurrency, filtered and churn each pass `extra=`
+        explicitly alongside it — so an `extra` key here is a duplicate
+        keyword argument. The failure is worse than it sounds for being
+        partial: build.py's ingest record passes no `extra` and writes fine,
+        and the index_build record immediately after it raises TypeError, so
+        the run dies one record into the first phase with a file that already
+        looks like it is working.
+
+        It is stamped in `Recorder.write` instead
+        (`harness/metrics/records.py`), which is the only point every ops
+        record provably passes through and is already where the ALL_PHASES
+        check lives.
         """
         return {
             "run_id": self.run_id,
@@ -46,11 +62,27 @@ class RunContext:
             "resource_pass": self.resource_pass,
             "dataset": dataset.name,
             "metric_space": dataset.metric,
-            "storage_engine": index.storage_engine,
+            # Asked of the DRIVER, not read off the IndexSpec. The spec's
+            # `storage_engine` is a MySQL-family `ENGINE=` clause that arrives
+            # populated for every engine (`--storage-engine` defaults to
+            # InnoDB and the orchestrator passes InnoDB for everything that is
+            # not MariaDB), and stamping it here published an InnoDB for
+            # PostgreSQL, Valkey and Percona Search -- 268, 128 and 120
+            # records of it in `full-20261015-215006`, beside the same run's
+            # honest `heap`, `memory` and `wiredTiger` from the ann path. Only
+            # the driver knows whether it put the value in a CREATE TABLE;
+            # `EngineDriver.storage_engine_in_use` is where that is decided
+            # and where the evidence is written down.
+            "storage_engine": driver.storage_engine_in_use(index),
             "march": self.march,
             "m": index.m,
             "ef_construction": index.ef_construction,
             "build_mode": index.build_mode,
+            # Ops version 9: the last build axis the ops records lacked. The
+            # ann path's records carry it, `report/builds.py` keys reference
+            # builds on it, and an ops record without it had to be matched by
+            # guesswork.
+            "quantization": index.quantization,
             "k": self.k,
             "timestamp": utcnow(),
         }

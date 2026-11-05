@@ -47,12 +47,25 @@ datasets:
   - dbpedia-openai-1000k-angular
 
 k: 10
-runs: 1
+runs: 2
+# Publishable: a report is written from this profile, so it measures every
+# ann point at least twice (`runs: 2`). With one run, the first configuration
+# of every sweep was a single draw on a cold index -- full-20260825 (a
+# tuned-complete run at `runs: 1`) published
+# ef_search 10 slower than ef_search 20 on every MySQL-family curve -- and
+# tests/test_config.py refuses `runs < 2` on any profile marked publishable.
+publishable: true
 default_resource_pass: tuned
 
 resources:
   cpu:
-    client_cpus: 16
+    # One client CPU per two clients of the largest count below, never fewer
+    # than four: 16 for the 1-32 sweep, which is what this line pinned by hand
+    # before `auto` existed. The ann fingerprint hashes the resolved count, so
+    # the switch did not move this profile's results tree; a host whose pool
+    # cannot spare 16 after the server set now refuses the run instead of
+    # quietly sharing cores.
+    client_cpus: auto
   # No extras override: the tuned pass resolves memory from host_fraction and
   # sweeps InnoDB only, which is what this profile wants.
 
@@ -71,6 +84,17 @@ ann:
 ops:
   enabled: true
   workloads: [build, concurrency, filtered, churn]
+  # Measure the build the headline is taken from. The report's headline is
+  # each engine's Pareto frontier over everything the ann phase swept, and a
+  # fixed M=16 ops build would put concurrency and churn from one index beside
+  # a frontier figure from another. `frontier` picks, per engine and dataset,
+  # the swept build fastest at the calibration target (0.95), after the ann
+  # phase and from its results; it falls back to the engine's declared
+  # reference build -- loudly -- when the ann phase left nothing to choose
+  # from. `m_values` below then applies only where the chosen build names no
+  # M (Percona Search, whose M is a label). See
+  # orchestrator/ops_build_selection.py.
+  build_selection: frontier
   m_values: [16]
   ef_search: 100
   subset_rows: null
@@ -79,7 +103,35 @@ ops:
   # The same grid the equal-budget run used, so the two are directly
   # comparable. The knee is between 1 and 4, which is why those points are all
   # present.
-  client_counts: [1, 2, 4, 8, 16, 32]
+  # No 2-client point: at n=2 both estimators of the achieved
+  # concurrency equal exactly the floor, so the verdict is noise.
+  # config/profiles/main.yml carries the measurement.
+  client_counts: [1, 4, 8, 16, 32]
   concurrency_duration_s: 60
+  # Three windows per client count, median reported with the spread beside it.
+  # Every figure in the 2026-08 run was a single sample, and the one point that
+  # happened to be re-measured came back 21% higher at sixteen and thirty-two
+  # clients -- enough to cover the gap between two engines that were being
+  # presented as ordered. Concurrency is the headline finding and the cheapest
+  # thing here to repeat: about fifteen extra minutes per engine on a run that
+  # takes days.
+  concurrency_repeats: 3
   selectivities: [0.10, 0.01]
   churn_fractions: [0.10]
+  # Two hours, not the thirty-minute default.
+  #
+  # The budget exists so that an engine which takes a write and never finishes
+  # it releases the machine instead of holding the run overnight -- which is
+  # what Valkey did before its pipelined-write defect was found. Thirty minutes
+  # was sized against that failure, not against a healthy engine.
+  #
+  # MHNSW and VIDX maintain the graph on every INSERT, so writing 99,000 rows
+  # back into a populated index takes them 58 to 99 minutes. All three were cut
+  # off at roughly 1,830 seconds with the re-insert unfinished, and the run
+  # recorded no churn result for any of them: the recall and throughput they
+  # would have had after churn are simply absent, and that was the study's
+  # largest single finding.
+  #
+  # Two hours clears the slowest observed re-insert with margin and is still
+  # far short of holding a run overnight.
+  churn_budget_s: 7200

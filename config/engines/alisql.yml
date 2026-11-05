@@ -43,6 +43,37 @@ build:
   # build appears to stall for a long stretch with no output. That is expected.
   # Budget 1.5-3 hours for a cold AliSQL build and several GB of scratch space.
   cmake_flags:
+    # NOT one of AliSQL's own release flags: it stops the TREE discarding the
+    # CFLAGS the builder exports. Source `CMakeLists.txt:793` defaults
+    # WITH_PACKAGE_FLAGS ON for a RELWITHDEBINFO standalone build on a DEB
+    # platform -- `build.type` above -- and `cmake/compile_flags.cmake:131`
+    # then OVERWRITES CMAKE_C_FLAGS with `dpkg-buildflags` output, so
+    # `-march: x86-64-v3` above is silently dropped and nothing reports it
+    # (`/opt/alisql/.march` is written from the build ARG). Both READ at the
+    # pin.
+    #
+    # THE LEVEL, NOT THE TOKEN. The `-O3` TOKEN is dropped with everything
+    # else, and docker/alisql/Dockerfile's delta lists it among the four lost
+    # here. What is NOT affected is the optimisation the compiler applies: the
+    # compile line ends with CMAKE_C_FLAGS_RELWITHDEBINFO's own
+    # `-O2 -g -DNDEBUG` whether the overwrite happens or not, so the effective
+    # level is 2 either way -- this tree says so itself at
+    # `CMakeLists.txt:2709-2719` (READ). An earlier version of THIS comment
+    # said `-march: x86-64-v3` "and `-O3`" were both silently dropped as
+    # though the second changed the generated code; it does not, and that is
+    # the half that was wrong.
+    #
+    # docker/alisql/Dockerfile carries the chain, the complete flag-by-flag
+    # delta and the consequence for AliSQL's already-published numbers, and
+    # tests/test_e8_package_flags_overwrite.py pins both copies.
+    #
+    # Duplicated with the Dockerfile's copy on purpose:
+    # `scripts/build-images.sh:119` appends this list as ${CMAKE_FLAGS} AFTER
+    # the Dockerfile's own flags, so a value here can only confirm, never
+    # remove. `-DCMAKE_C_FLAGS=`, the other half of the fix, is deliberately
+    # NOT here -- appended last it would win, carrying whatever literal this
+    # file held instead of the `$CFLAGS` the builder actually exported.
+    - -DWITH_PACKAGE_FLAGS=OFF
     - -DFORCE_INSOURCE_BUILD=ON
     - -DWITH_UNIT_TESTS=0
     - -DWITH_DEBUG=0
@@ -86,34 +117,20 @@ build:
   # default keeps mysqld and libduckdb on one ABI, which is what actually links.
   extra_cxxflags: ""
 
-sql:
-  # Vector features ship disabled, and every vector operation demands RC.
-  # Getting either of these wrong yields ER_VECTOR_DISABLED / ER_NOT_SUPPORTED_YET.
-  session_setup:
-    - "SET SESSION transaction_isolation = 'READ-COMMITTED'"
-    - "SET SESSION default_storage_engine = InnoDB"
-  global_setup:
-    - "SET GLOBAL vidx_disabled = OFF"
-  create_table: |
-    CREATE TABLE {table} (
-      id INT PRIMARY KEY,
-      v VECTOR({dim}) NOT NULL,
-      VECTOR INDEX vi (v) M={m} DISTANCE={metric}
-    ) ENGINE={engine}
-  # Field_vector::store() accepts a binary string of exactly 4*dim bytes, so we
-  # bind raw float32 exactly as for MariaDB rather than paying VEC_FROMTEXT()
-  # text-parsing cost. Keeping the client path identical across the two
-  # MySQL-family engines is what makes their ingest numbers comparable.
-  insert: "INSERT INTO {table} (id, v) VALUES (%s, %s)"
-  vector_binding: binary_f32
-  query: "SELECT id FROM {table} ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
-  query_filtered: "SELECT id FROM {table} WHERE tag < %s ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
-  set_ef_search: "SET vidx_hnsw_ef_search = {ef_search}"
-  explain: "EXPLAIN {query}"
-  index_plan_marker: "vi"
-  metrics:
-    angular: COSINE
-    euclidean: EUCLIDEAN
+# There is deliberately no `sql:` block. Every statement the ops harness sends
+# is built in harness/drivers/mysql_family.py -- harness/ is mounted into the
+# bench container on its own and cannot read config/, so nothing here could
+# ever have been executed. The statements that do belong to this engine and are
+# not in that file are `runtime.probe`'s below, and docker/alisql/init.sql's,
+# which --init-file runs on every start.
+#
+# `SET GLOBAL vidx_disabled = OFF` is the one statement the removed block held
+# that a server genuinely needs, and it has two live homes, neither of them
+# here: ALISQL_DIALECT.global_setup in the driver, and init.sql -- which is
+# where tests/verify-alisql-traps.sh says it comes from. The rest of the block
+# had drifted unnoticed, because no reader existed: a CREATE TABLE with no
+# `tag` column beside its own `tag` filter, and no mention of `ctag` once that
+# column arrived. tests/test_c1_engine_sql.py fails if a block comes back.
 
 server:
   common:
@@ -138,6 +155,19 @@ server:
     - --innodb-flush-method=O_DIRECT
     - --transaction-isolation=READ-COMMITTED
     - --skip-log-bin
+  # Opt-in, ops path only: rendered after the pass's flags when a profile
+  # sets `ops.server_wait_instruments: true` (`config.ops_wait_instruments`),
+  # and recorded in `engines_resolved` and on every record when it is.
+  # performance_schema is ON by default on this server and these three
+  # families are OFF by default; with them off, the per-window wait profile
+  # still has file IO, table IO and table-lock waits, but no latch can show
+  # up in it. Turning them on puts a timer read on every latch acquisition,
+  # so measure the overhead in a smoke run before publishing with it on.
+  wait_instruments:
+    - --performance-schema=ON
+    - --performance-schema-instrument=wait/synch/mutex/%=ON
+    - --performance-schema-instrument=wait/synch/rwlock/%=ON
+    - --performance-schema-instrument=wait/synch/sxlock/%=ON
 
 storage_engines:
   normalized: [InnoDB]
@@ -158,3 +188,62 @@ capabilities:
 plan_guard:
   verify_index_used: true
   force_index_hint: "FORCE INDEX (vi)"
+
+# Runtime facts the orchestrator needs to start and speak to this engine.
+#
+# These used to be six dictionaries keyed by engine name, spread across
+# ann_pass, ops_pass, cli, charts and render. Adding an engine meant finding all
+# six, and missing one produced a failure hours later rather than at load. They
+# live here because everything else about an engine already does.
+runtime:
+  # Which harness driver drives it. A new *architecture* needs a new
+  # driver in harness/drivers/; a new variant of this family does not.
+  # Presentation and iteration order. Discovery is by directory, which is
+  # alphabetical, and alphabetical is not the order this comparison is read
+  # in -- the original three come first.
+  order: 20
+  driver: AliSQLDriver
+  # Class name ann-benchmarks expects in the generated config.yml.
+  ann_constructor: AliSQL
+  port: 3306
+  # Where the server keeps its data inside the image.
+  data_mount: /var/lib/vbench
+  server_data_mount: /server-data/data
+  # Where mysqld's own diagnostics land INSIDE the container, i.e. what the
+  # entrypoint gives --log-error. Must equal LOG_FILE's default in
+  # docker/alisql/entrypoint-alisql.sh;
+  # tests/test_e10_failures_explain_themselves.py reads both and fails if they
+  # drift. A file in the data volume rather than a stream, so `docker logs`
+  # carries only the entrypoint banner and teardown removes the rest with the
+  # volume; ops_pass copies it out first.
+  error_log: /var/lib/vbench/alisql.err
+  credentials:
+    user: "bench"
+    password: "bench"
+  # Opt-in engines are not in the original three-way comparison.
+  group: original
+  # Readiness probe, run inside the server container until it succeeds.
+  probe:
+    - "sh"
+    - "-c"
+    - "/opt/alisql/bin/mysql -ubench -pbench --socket=/var/run/vbench/alisql.sock -e 'SELECT 1' >/dev/null 2>&1"
+  chart:
+    color: "#d62728"
+    marker: "s"
+    linestyle: "--"
+    label: "AliSQL (VIDX)"
+  label: "AliSQL (VIDX)"
+  # The index the ops pass builds. §4's secondary table ("at the build the
+  # ops pass measured") is taken from it, and a headline floor figure from any
+  # other build is marked, because the load, build, concurrency, filtered and
+  # churn sections describe this index. `full-20260825` published Percona
+  # Search's floor figures from the unquantized sweep beside ops figures from
+  # the scalar index (which peaks at recall 0.892), and
+  # pgvector's and Valkey's from efC=400 beside ops figures at 200 and the
+  # server default. A value of `ops` is resolved per profile and
+  # pass from what `orchestrator/ops_pass.py` passes the harness
+  # (`orchestrator/reference_build.py`), and `cmd_run` refuses a build the ann grid
+  # does not contain rather than reporting "—" for a whole engine afterwards.
+  # Graph degree is VIDX's only build knob; the ops pass builds M=16.
+  reference_build:
+    m: 16

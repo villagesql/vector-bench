@@ -54,16 +54,53 @@ everything else.
 ## 2. What each profile actually costs
 
 Ingest time only, before any query runs. Three engines, from the measured rates
-above.
+above — hand arithmetic, kept because it shows where the cost comes from. **The
+live figures are in the next table**, and two rows here no longer agree with any
+method († and ‡). A third marker, §, flags a row whose figure is current but
+whose profile changed for a reason worth knowing before you plan around it:
 
 | Profile | Datasets | Passes | Ingest |
 | --- | --- | --- | ---: |
 | `dev` | tiny synthetic | 1 | ~1 min |
 | `smoke` | fashion-mnist | 1 | ~30 min |
-| `quick` | fashion-mnist, glove-100 | 1 | ~14 h |
-| `main` | glove-100, sift-128 | 1 | **~46 h (~2 days)** |
+| `quick` | fashion-mnist, glove-100 | 1 | ~35 h † |
+| `main` | glove-100, sift-128 | 1 | **~61 h (~2.5 days)** § |
 | `full` | all four | 2 | **~272 h (~11 days)** |
-| `mariadb-blog` | dbpedia-openai-1000k | 1 | **~10.5 h** (measured) |
+| `mariadb-blog` | dbpedia-openai-1000k | 1 | **~10.5 h** (measured) ‡ |
+
+† **Corrected.** This row said ~14 h, which was not a measurement of anything:
+it was the same hand arithmetic as the rows around it against an M grid
+`quick` no longer has. It sweeps `ann.m_values: [8, 16, 32]` and every M value
+reloads the whole corpus, so the hand method now gives ~35 h and the estimator
+says ~36 h.
+
+‡ **Measured, but for one load per engine, not for the run.** The 10.5 h is the
+real figure from §6 — 3.3 h MariaDB, 6.6 h AliSQL, ~0.5 h pgvector — and it is
+one load each. The profile runs the recall phase and the ops phase, and each
+loads the corpus for its own M value, so the run pays it about twice: the
+estimator says ~21 h.
+
+§ **`main` grew an M value for a cross-check, not for the frontier.**
+PR 5 §5.2 matches an ops calibration point to an ann recall point at the same
+`M`, and `main` swept `ann.m_values: [8, 32]` against `ops.m_values: [16]` —
+grids that never meet, so the report's "Consistency checks" section was empty
+by construction. `ann.m_values` is now `[8, 16, 32]`, which is a third full
+reload of both corpora per engine: this row went from ~46 h to ~61 h by the
+hand method and the estimator's figure from ~51.1 h to ~68.1 h. Restricting
+M=16 to sift-128 alone would have saved about half of the increase, and needs
+a per-dataset ann axis the config does not have.
+
+**That increase is an upper bound, and by a knowable amount.** The estimator
+charges every M value the same corpus reload at one rate per engine — 147
+rows/s for MariaDB on glove-100, which `orchestrator/estimate.py` states is
+the observed *mid-grid* number. M=16 is the cheap middle of this grid: the
+table in §1 measures it at ~200 rows/s, so the extra M really costs ~1.6 h
+there against the ~2.2 h the estimate charges, and the estimate is high on
+the marginal M by about a third. The same flat rate makes the *total* low:
+§1's measured per-M times sum to ~7.4 h for the three-value grid where three
+flat loads charge ~6.7 h, about 9% under. So plan against the printed figure
+— it is the conservative one for the decision this footnote is about — and
+do not read either number as a measurement of a per-M cost.
 
 `full` describes the complete measurement space. It is not a recommendation.
 Running it end to end is a deliberate decision to spend a fortnight, and
@@ -73,28 +110,241 @@ dimensions it is ~19 h of loading per phase.
 **`main` is the profile to run.** It was sized from these measurements to
 answer the questions the smoke run raised without spending a fortnight.
 
-A run prints its own estimate before starting:
+### Ingest is not the run
+
+The table above is loading only, and so was the only estimate this framework
+printed for most of its life. **Querying is not free**, and for a profile like
+`smoke` it is most of the cost: half an hour of loading against a churn budget
+that can run for eight (two hours per step since ops measurement version 9,
+up from half an hour). What the estimator prints now is both, the same three
+engines:
+
+| Profile | Passes | Ingest | Query, typical | Query, worst case | Run, worst case |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `dev` | 1 | ~0.0 h | ~0.01 h | ~0.2 h | **~0.21 h** |
+| `smoke` | 1 | ~0.3 h | ~0.07 h | ~8.7 h | **~9.01 h** |
+| `quick` | 1 | ~36.2 h | ~2.69 h | ~36.4 h | **~72.61 h** |
+| `main` | 1 | ~68.1 h | ~5.78 h | ~39.5 h | **~107.58 h** |
+| `full` | 2 | ~532.0 h | ~79.33 h | ~473.6 h | **~1005.63 h** |
+| `mariadb-blog` | 1 | ~21.3 h | ~1.69 h | ~7.6 h | **~28.95 h** |
+
+The ingest column differs from the table above it because that one was computed
+by hand from §1's three headline rates, while the estimator uses the measured
+per-`(engine, dataset)` figures in `_MEASURED_ROWS_PER_S` and scales for corpus
+size and dimensionality. The estimator is the live number; §8 explains why it
+changes when someone measures a rate.
+
+**Plan against the worst case.** A run longer than the printed worst case is a
+bug, and that is the point of printing it. Two things to understand about what
+it is:
+
+* It is a bound over **the configuration, not the machine.** Where a cost is a
+  budget — `ops.churn_budget_s`, two hours per churn step by default — the worst case
+  is that budget, whatever the engine does inside it. Where it is a modelled
+  duration, it is modelled from rates measured on one machine and yours will
+  differ. The typical figure is what the configuration should cost; the worst
+  case is what it cannot be made to exceed by an engine behaving badly.
+* It is honest about its holes, and prints them. Filtered search runs a fixed
+  number of queries at a rate nothing here has measured, so it is listed with
+  a ceiling and **no typical duration** — `~0.0 h typical, ~7.0 h worst case`
+  rather than one confident figure. The ceiling is real:
+  `ops.filtered_budget_s` caps every (column, selectivity, iterative-scan
+  mode) point at five minutes, the workload stops the query loop when it is
+  spent, and the record says so. Until that budget existed this was the one
+  term with no bound at all, and the run figure had to say in as many words
+  that it was not yet a ceiling — so the "a run longer than its printed
+  estimate is a bug" convention was false for every profile that measured
+  filtered search, which is all of them but `m-sweep`. The recall sweep, the
+  churn re-measurements and the concurrency warm-ups are still named under
+  the total, because those are counted in queries and no rate exists to price
+  them. A dataset with no measured ingest rate has always been reported this
+  way; this is the same treatment for query time.
+
+A run prints all of it before starting:
 
 ```
 estimated ingest time (loading only, before any queries):
-  mariadb ~12.1 h  |  alisql ~33.1 h  |  pgvector ~0.6 h
-  total ~45.8 h across 1 pass(es), 2 M value(s)
-  ! This is a long run...
+  mariadb ~17.5 h  |  alisql ~49.7 h  |  pgvector ~0.9 h
+  total ~68.1 h across 1 pass(es), 3 M value(s)
+  ! This is a long run. Each M value costs a full reload of every dataset,
+    and MHNSW/VIDX build incrementally at a few hundred rows/s. Reduce
+    ann.m_values or the dataset list to cut it roughly proportionally.
+
+estimated query time (the parts the profile puts a clock on):
+  concurrency windows    ~1.3 h
+                           5 client count(s) x 30s x 3 repeat(s) + one warm-up window each per ops unit, fixed by the profile not by the engine
+  filtered search        ~0.0 h typical, ~6.0 h worst case
+                           e.g. 2 filter column(s) x 3 selectivities x 1 iterative-scan mode x 500 queries = 3,000 queries per ops unit, at a rate nothing here has measured; 300s cap/point bounds it
+  churn re-insert        ~4.3 h typical, ~32.0 h worst case
+                           e.g. 295,878 rows written back at ~147 rows/s (the load rate; re-insert can be far slower), 7200s cap/step
+  churn reader baseline  ~0.1 h
+                           2 churn fraction(s) x 30s of 4 reader(s) before each step's deletes, fixed by the profile not by the engine
+  subtotal ~5.8 h typical, ~39.5 h worst case
+
+estimated run time ~73.9 h typical, ~107.6 h worst case
+  Plan against the worst case: a run materially longer than it is a bug.
+  Each budgeted term tests its deadline before starting work, so it can overrun
+    by the one query or slice already running when the budget expires.
+  ! Neither figure includes the costs below. They are a number of queries, and
+    there is no measured query rate for mariadb, alisql, pgvector to multiply them by:
+      recall/QPS sweep: every ann.ef_search point, `runs` times, over each dataset's query set, plus a one-time index warm-up of up to 5,000 training-set queries per built index
+      churn re-measurement: ops.max_queries before churn and again after each churn fraction
+      churn delete: ops.churn_fractions of the corpus removed per step, with no budget bounding the delete itself
+      churn repair path: on an engine that has one it can execute at its pinned version (pgvector's VACUUM (ANALYZE); Percona Server's index replace only while capabilities.vector_index_replace is true -- it is false at the pinned version, where the driver declares no repair path, runs nothing and pays neither cost), driver.maintain() per churn fraction plus a third ops.max_queries measurement of the repaired index -- the repair has no measured rate at any corpus size and nothing caps either
+      concurrency warm-up: 50 queries per client before each measured window
+      filtered ground truth: exact top-k recomputed by brute force over the qualifying rows of every (column, selectivity), over the whole test set rather than ops.max_queries and outside ops.filtered_budget_s; cached per (dataset, metric, k, column, threshold, rows) and shared across engines, ops units and passes, so paid once each -- measured at ~150 s per million qualifying rows (5-8% spread, near dimension-independent below ~256), which is ~6.7 min for main's two datasets x two columns
 ```
 
 Read it. It is the cheapest part of the whole exercise.
+
+The web UI shows the same breakdown on its Profiles & launch page — ingest, each
+query term, and the worst-case total — updating as you change the engine list,
+the dataset list or the resource pass, so you can find an affordable scope before
+committing rather than after. It is the same calculation, not a second one: both
+call `estimate_load_hours()` in `orchestrator/estimate.py`, so they cannot
+disagree about the same plan. See [08-web-ui.md](08-web-ui.md).
+
+### The ann grid, counted build by build
+
+The ingest line above charges every engine one corpus reload per entry of
+`ann.m_values`. ann-benchmarks reloads for every *build* -- every
+(M, ef_construction, quantization) the rendered config asks for -- so an
+engine with a second axis costs more than that line says: under
+`tuned-complete` pgvector and Valkey build three indexes each, not one, and
+the tuned pass's `m_values_by_engine` gives the MySQL-family engines two. The
+published figures in this document and README are left on the old basis so
+they stay comparable with each other; `run` now prints a second block beneath
+them, from `orchestrator/estimate_grid.py`, that counts what the render asks
+for and prices each load by its M where the load builds the graph
+(MariaDB, AliSQL, Percona Server: `(M/16)^1.1` of the M=16 rate, from MariaDB's
+glove-100 rates at M=8 and M=32). When it appears it also says by how much
+the run time above is low and what to plan against instead, names the axis
+that multiplies each engine's builds (the headline's "Reduce ann.m_values"
+advice is withheld then, because the multiplier may be ef_construction or
+quantization), and lists what neither figure prices: the bulk index builds of
+the engines that build after the load, the recall/QPS sweep, and any engine
+with no measured ingest rate.
+
+## 2a. Exploring the whole parameter space: the two-stage frontier
+
+A reviewer of `full-20260825` asked for the frontier over M = 4, 6, 8, 12, 16,
+32, 48 on every engine, with ef_construction and quantization swept where the
+engine has them. At 990,000 rows that grid is not affordable: counted by the
+block above it is **~267 h of ann loads** -- 7 MariaDB / 12.3 / AliSQL builds
+at 31, 45 and 53 h, and 21 Percona Server builds at ~129 h -- before a single
+query, and before tuned-complete's ops phase. So it is done in two stages.
+
+**Stage 1 -- explore at 90,000 rows** (`config/profiles/frontier-explore.yml`).
+Every engine with a graph-degree knob sweeps the reviewer's seven M values;
+pgvector, Valkey, Percona Server, MyVector and VillageSQL also sweep
+ef_construction 64/200/400; Percona Search sweeps quantization scalar/none at
+one M label (mongot exposes no graph degree here -- the profile header says
+why `maxEdges` is not used). Seven builds are left out by name, each printed
+before the run (`orchestrator/ann_knobs.py`) and never clamped: pgvector
+refuses ef_construction < 2·M, so M=48 at 64 is dropped, and vsql_vector
+refuses ef_construction > 32·M, so VillageSQL loses 200 and 400 at M=4 and 6
+and 400 at M=8 and 12. VillageSQL is opt-in
+(`runtime.default_selected: false`): a bare run leaves it out and says so, and
+only `--engines ...,villagesql` measures it. `runs: 2`, because the
+selection is made on QPS too and a single cold draw can push a build off the
+frontier.
+
+| Engine | Builds | Ann loads, estimated |
+| --- | ---: | ---: |
+| `alisql` | 7 | ~6.0 h |
+| `percona` | 21 | ~3.6 h |
+| `mariadb123` | 7 | ~3.0 h |
+| `mariadb` | 7 | ~2.2 h |
+| `pgvector` | 20 | ~0.3 h |
+| `valkey`, `mongodb` | 21, 2 | minutes |
+| `myvector` | 21 | no measured rate |
+| `villagesql` (opt-in) | 15 | no measured rate |
+
+About **15 h of loads** plus the queries, which no rate prices (the recall
+sweep is named under the total as always); the bulk index builds of the
+post-load engines are in neither figure.
+
+```bash
+./scripts/generate-dataset.sh dbpedia-openai-100k-angular
+./run-benchmark.sh run --profile frontier-explore
+```
+
+**Selection** (`select-builds`, `orchestrator/build_selection.py`). Reads the
+stage-1 run's `report/records.jsonl` -- run `report --run-dir` first if it
+was skipped -- and per engine, over every point that used the vector index:
+
+* the **winner** at each floor 0.90 / 0.95 / 0.99: the build owning the
+  frontier point with the smallest recall at or above it;
+* every build owning a frontier point **near** a floor, defined as
+  |recall − floor| ≤ 0.015 -- the most recall at fixed M moved between 90,000
+  and 990,000 rows (M=16, 0.014), so a build that close can be on the other
+  side of the floor at full size;
+* for a floor nothing reaches, the build with the highest recall, recorded as
+  an unreached floor;
+* the **neighbouring M** below and above each of those, at the same
+  ef_construction and quantization, so stage 2 can confirm the choice
+  transfers. A kept M=4 or M=48 has one neighbour and an edge note: the
+  optimum may lie outside the explored grid. Where the next M exists but the
+  engine cannot build it at that ef_construction (pgvector M=48 at 64), the
+  note says so instead. A neighbour stage 1 has no point for -- a failed
+  build, or one that fell back to a scan -- is **dropped**, with that reason:
+  there is nothing to confirm a transfer against, and a build that failed at
+  90,000 rows is hours lost at 990,000;
+* the target profile's **reference build**, always (`run` refuses a grid
+  without it).
+
+Everything else is pruned, with its reason. **The overlay names the kept
+builds exactly** (`ann_builds_by_engine`), so there is no closure: per-axis
+lists alone would be multiplied out by `render_config`, and on Percona Server
+three chosen builds -- M=12 at 64, 16 at 200, 32 at 400 -- would come back as
+nine, ~60 h of loads at 990,000 rows instead of ~20 h.
+
+```bash
+./run-benchmark.sh select-builds --from results/<stage-1 run id> \
+    --out state/frontier-stage2.yml
+```
+
+It refuses to write an overlay whose rendered grid is not exactly the kept
+set, or one `run` would refuse, and refuses a stage 1 that swept more than one
+build mode or MariaDB storage engine (the selection cannot tell them apart).
+
+**Stage 2 -- re-measure at 990,000 rows.** The overlay is applied to
+`tuned-complete` (`orchestrator/profile_overlay.py`): it may set only the
+build-axis keys of `resources.extras`, each checked at load against the
+engine's legal range and enumeration; it merges the way a profile's
+`resources:` block always has; it must carry its `build_selection` block,
+whose `overlay_sha256` covers both the grid and the provenance, so neither can
+be edited without the other; and it is refused on the normalized pass, which
+ignores those keys by design.
+
+```bash
+./run-benchmark.sh run --profile tuned-complete --resource-pass tuned \
+    --overlay state/frontier-stage2.yml
+```
+
+What it costs depends on what stage 1 keeps, and the run prints it. For
+scale: three M values per engine at one ef_construction (say 12/16/32) is
+**~82 h** of ann loads, against ~22 h for tuned-complete's own grid and
+~267 h for the whole space -- most of it MariaDB 12.3 and AliSQL at M=32.
+The stage-2 manifest records `build_selection`: the stage-1 run id and path,
+the grid explored, every kept and pruned build with its reasons, and every
+stage-1 (build, ef_search, recall, QPS) of the kept builds, so a later report
+can flag any pair whose recall moved by more than 0.02 between the stages.
+A resume must pass the same overlay; a different one, or none, is refused.
 
 ---
 
 ## 3. Choosing a scope
 
-Measured options, all three engines:
+Measured options, all three engines. **Ingest only** — add query time from the
+second table in §2, which the estimator prints for whatever scope you actually
+ask for.
 
 | Scope | Ingest |
 | --- | ---: |
 | `--profile full --resource-pass both` | 272 h |
-| `--profile main` | 46 h |
-| `--profile main --datasets glove-100-angular` | **25 h** |
+| `--profile main` | 61 h |
+| `--profile main --datasets glove-100-angular` | **33 h** |
 | `--profile main --datasets glove-100-angular --phases ops` | 8 h |
 
 If you run one thing, run this:
@@ -384,5 +634,5 @@ An earlier version of the estimator used rates guessed from a 60,000-row smoke
 run and was optimistic by 2.7× against the first real 1.18M-row load. That is
 worse than having no estimate at all, because it invites you to start something
 you would not have started. If your measured rates diverge from these, update
-`_INGEST_ROWS_PER_S` in `orchestrator/cli.py` — the estimate is only as honest
+`_INGEST_ROWS_PER_S` in `orchestrator/estimate.py` — the estimate is only as honest
 as the numbers behind it.

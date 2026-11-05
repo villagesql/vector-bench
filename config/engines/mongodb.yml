@@ -85,6 +85,16 @@ server:
     - "skipAuthenticationToSearchIndexManagementServer=true"
     - --setParameter
     - "useGrpcForSearch=true"
+  # WiredTiger's cache is this engine's buffer pool, so it is sized from the
+  # resource pass's buffer share exactly as InnoDB's buffer pool and
+  # pgvector's shared_buffers are (`orchestrator/config.py`
+  # `resolve_resources`, `wiredtiger_cache_bytes`). Until ops measurement
+  # version 9 nothing set it: `full-20260825` ran mongod on its own default
+  # of 57-64 GB beside a 42.3 GB InnoDB buffer pool.
+  normalized:
+    - --wiredTigerCacheSizeGB={wiredtiger_cache_gb}
+  tuned:
+    - --wiredTigerCacheSizeGB={wiredtiger_cache_gb}
 
 resources:
   # Heap scales with the number of indexed fields, not with the number of
@@ -94,9 +104,12 @@ resources:
   # queries, which MongoDB's own guidance warns against above 50%.
   mongot_heap_gb: 8
   # The rest of the container is left to WiredTiger and the filesystem cache.
-  # mongod takes the same fraction the other engines give their buffer pool so
-  # the split is not invented here.
-  wiredtiger_cache_fraction: 0.6
+  # mongod takes the same buffer share the other engines give their buffer
+  # pool, so the split is not invented here -- the `server:` flags above.
+  # (A `wiredtiger_cache_fraction: 0.6` sat here until ops version 9 and
+  # nothing read it; it was removed rather than wired, because a second
+  # fraction for one engine is the asymmetry the resource pass exists to
+  # prevent.)
 
 storage_engines:
   normalized: [wiredTiger]
@@ -117,3 +130,78 @@ capabilities:
   prefilter: true
   # createSearchIndex returns before the index exists.
   async_index_build: true
+
+# Runtime facts the orchestrator needs to start and speak to this engine.
+#
+# These used to be six dictionaries keyed by engine name, spread across
+# ann_pass, ops_pass, cli, charts and render. Adding an engine meant finding all
+# six, and missing one produced a failure hours later rather than at load. They
+# live here because everything else about an engine already does.
+runtime:
+  # Which harness driver drives it. A new *architecture* needs a new
+  # driver in harness/drivers/; a new variant of this family does not.
+  # Presentation and iteration order. Discovery is by directory, which is
+  # alphabetical, and alphabetical is not the order this comparison is read
+  # in -- the original three come first.
+  order: 50
+  driver: MongoDriver
+  # Class name ann-benchmarks expects in the generated config.yml.
+  ann_constructor: PerconaSearch
+  port: 27017
+  # Where the server keeps its data inside the image.
+  data_mount: /var/lib/vbench
+  server_data_mount: /server-data/mongot
+  # NOT a server error log, and the key's name oversells it: `mongod` itself
+  # runs in the foreground with no redirection, so its log is on the
+  # container's stdout and `docker logs` has it. THIS IS MONGOT'S, the search
+  # side -- docker/mongodb/entrypoint-mongodb.sh's `start_mongot` redirects it
+  # to "${MONGOT_DATA}/mongot.log" with MONGOT_DATA defaulting to
+  # /var/lib/vbench/mongot, i.e. into the data volume that teardown deletes.
+  # Vector search on this engine happens in mongot, so a phase that failed
+  # against an index stuck in PENDING explains itself there and nowhere else,
+  # and until this key that file left no trace in the run directory.
+  # tests/test_e10_failures_explain_themselves.py composes the same path from
+  # the entrypoint and fails if either half moves.
+  error_log: /var/lib/vbench/mongot/mongot.log
+  credentials:
+    user: "bench"
+    password: "bench"
+  # Opt-in engines are not in the original three-way comparison.
+  group: extra
+  # Readiness probe, run inside the server container until it succeeds.
+  # Not a ping: mongod answers one while still SECONDARY, and a load that
+  # starts before the election completes fails on its first write. This
+  # checks both processes -- mongod answers well before mongot's JVM does,
+  # and an index created in that window never gets an initial sync queued.
+  probe:
+    - "sh"
+    - "-c"
+    - "mongosh --quiet --port 27017 -u bench -p bench --authenticationDatabase admin --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true && (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null"
+  chart:
+    # A distinct hue: the only engine whose index lives in a separate
+    # process, so it should not read as a variant of anything else.
+    color: "#9467bd"
+    marker: "v"
+    linestyle: "-"
+    label: "Percona Search (mongot)"
+    # The table has room for the full name; the chart legend does not.
+  label: "Percona Search for MongoDB (mongot)"
+  # The index the ops pass builds. §4's secondary table ("at the build the
+  # ops pass measured") is taken from it, and a headline floor figure from any
+  # other build is marked, because the load, build, concurrency, filtered and
+  # churn sections describe this index. `full-20260825` published Percona
+  # Search's floor figures from the unquantized sweep beside ops figures from
+  # the scalar index (which peaks at recall 0.892), and
+  # pgvector's and Valkey's from efC=400 beside ops figures at 200 and the
+  # server default. A value of `ops` is resolved per profile and
+  # pass from what `orchestrator/ops_pass.py` passes the harness
+  # (`orchestrator/reference_build.py`), and `cmd_run` refuses a build the ann grid
+  # does not contain rather than reporting "—" for a whole engine afterwards.
+  # No `m`: mongot exposes no graph degree, and `render_config` gives this
+  # engine `m_values[:1]` as a label only -- M=8 on `main`/`full`/`quick`,
+  # whose ann grids start at 8. Declaring m=16 would refuse those profiles
+  # over a number the index never reads. Quantization is the build axis, and
+  # `ops` because the ops pass takes it from the tuned extras' first value
+  # (scalar) or the profile's `ann.mongodb_quantization` (none) by pass.
+  reference_build:
+    quantization: ops

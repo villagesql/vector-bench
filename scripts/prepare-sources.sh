@@ -13,9 +13,14 @@
 #     clone into sources/ using the local repo as an object `--reference`
 #     (fast, almost no network for the main history) and then initialise only
 #     the submodules the build actually requires.
+#   * Percona Server HAS four submodules and still takes the AliSQL path, not
+#     the MariaDB one, because all four are switched off by cmake flags in the
+#     build rather than populated. It is also the one engine pinned to a SHA on
+#     a branch rather than to a tag -- see prepare_percona.
 #
 # Usage:
-#   scripts/prepare-sources.sh [--engine mariadb|alisql|pgvector|all] [--force]
+#   scripts/prepare-sources.sh [--engine mariadb|alisql|pgvector|percona|myvector|villagesql|villagesql84|all]
+#                              [--force]
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -28,7 +33,7 @@ while [[ $# -gt 0 ]]; do
     --engine) ENGINE="$2"; shift 2 ;;
     --engine=*) ENGINE="${1#*=}"; shift ;;
     --force) FORCE=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -100,6 +105,74 @@ prepare_alisql() {
   mv "$tar.tmp" "$tar"
   record_meta alisql "$tag" "$sha" "$origin"
   stage_context alisql "$tar"
+}
+
+# ---------------------------------------------------------------------------
+# Percona Server — pinned to a SHA, and deliberately WITHOUT its submodules
+# ---------------------------------------------------------------------------
+#
+# Same shape as prepare_alisql: a pure offline `git archive`, no network when
+# the commit is already in the local checkout. Two things differ and both are
+# deliberate.
+#
+# 1. THE PIN IS A COMMIT, NOT A TAG. `source.tag` holds a SHA because the
+#    pin is commit 56124b03, the tip of Percona PR #6278 on base `9.7`, and
+#    has no release to name. `git archive` takes a commit-ish wherever it
+#    takes a tag, so the mechanism is unchanged -- but `refs/tags/$tag` is not
+#    how this one is resolved, which is why the verify below is
+#    `rev-parse "$sha^{commit}"` against the bare object rather than against a
+#    tag ref. Compare SHAs and never dates: the series was rebased onto `9.7`,
+#    so its author and committer dates disagree.
+#
+# 2. NO SUBMODULES, AND THAT IS NOT AN OMISSION. The pin has four of them --
+#    percona-xtradb-cluster-galera, storage/rocksdb/rocksdb, extra/coredumper
+#    and extra/jwt-cpp -- and MariaDB's branch above exists precisely because
+#    `git archive` cannot carry a submodule. Percona does not need the clone
+#    treatment because all four are switched OFF in the build instead, which
+#    takes four cmake flags (docker/percona/Dockerfile note 2). Cloning to
+#    populate submodules we then disable would fetch from three more hosts for
+#    code that is never compiled.
+prepare_percona() {
+  local cfg="$VB_CONFIG/engines/percona.yml"
+  local sha; sha="$(yq_get "$cfg" source.tag "")"
+  [[ -n "$sha" ]] || die "percona: config/engines/percona.yml has no source.tag"
+  local upstream; upstream="$(yq_get "$cfg" source.upstream https://github.com/percona/percona-server.git)"
+  local tar="$VB_SOURCES/percona-${sha}.tar"
+  local repo="$VB_REPO_PERCONA" origin=local
+
+  if [[ ! -d "$repo/.git" ]] \
+     || ! git -C "$repo" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+    warn "percona commit ${sha:0:12} not available locally; cloning from $upstream"
+    repo="$VB_SOURCES/percona-git"
+    origin=upstream
+    if [[ ! -d "$repo/.git" ]]; then
+      # No --depth: a shallow clone holds only the default branch's tip, and
+      # the pin is an older commit on `9.7` (that branch has moved past it),
+      # so the failure would arrive as "fatal: not a tree object" after the
+      # download rather than before it.
+      git clone --quiet "$upstream" "$repo"
+    fi
+    git -C "$repo" cat-file -e "${sha}^{commit}" 2>/dev/null \
+      || git -C "$repo" fetch --quiet origin "$sha" 2>/dev/null || true
+  fi
+
+  # Resolve and re-verify: this is the line that makes the SHA an identity
+  # check and not just a string that got passed along.
+  local resolved; resolved="$(git -C "$repo" rev-parse "${sha}^{commit}")" \
+    || die "percona: commit $sha is not in $repo"
+  [[ "$resolved" == "$sha" ]] \
+    || die "percona: source.tag $sha resolved to $resolved -- not the pinned commit"
+
+  if tarball_current percona "$resolved" "$tar"; then
+    ok "percona: source tarball up to date ($(human_bytes "$(stat -c%s "$tar")"))"
+    stage_context percona "$tar"; return
+  fi
+
+  info "percona: exporting ${sha:0:12} from $repo (read-only git archive)"
+  git -C "$repo" archive --format=tar --prefix=source/ "$resolved" > "$tar.tmp"
+  mv "$tar.tmp" "$tar"
+  record_meta percona "$sha" "$resolved" "$origin"
+  stage_context percona "$tar"
 }
 
 # ---------------------------------------------------------------------------
@@ -300,15 +373,186 @@ prepare_valkey() {
 }
 
 
+# ---------------------------------------------------------------------------
+# MyVector — TWO pinned sources in one context: the plugin at a commit, and
+# the MySQL server tree it is compiled into, at a tag.
+# ---------------------------------------------------------------------------
+#
+# The plugin is built in-tree (`plugin/myvector/`), which is the vendor's own
+# plugin recipe, so the context tarball carries the MySQL tree as `source/`
+# and the plugin tree beside it as `myvector/`; the Dockerfile copies the
+# plugin files into place the way upstream's CI does. Both are shallow
+# fetches into sources/ -- nothing here touches a vendor checkout.
+#
+# The manifest's `engines.myvector.source` is this function's JSON, so it is
+# where the plugin commit AND the server tag/commit are recorded.
+prepare_myvector() {
+  local cfg="$VB_CONFIG/engines/myvector.yml"
+  local sha; sha="$(yq_get "$cfg" source.tag "")"
+  [[ -n "$sha" ]] || die "myvector: $cfg has no source.tag"
+  local release; release="$(yq_get "$cfg" source.release "")"
+  local upstream; upstream="$(yq_get "$cfg" source.upstream https://github.com/askdba/myvector.git)"
+  local server_tag; server_tag="$(yq_get "$cfg" source.server_tag "")"
+  [[ -n "$server_tag" ]] || die "myvector: $cfg has no source.server_tag"
+  local server_up; server_up="$(yq_get "$cfg" source.server_upstream https://github.com/mysql/mysql-server.git)"
+
+  local plugin_repo="$VB_SOURCES/myvector-git"
+  if [[ ! -d "$plugin_repo/.git" ]]; then
+    info "myvector: fetching plugin commit ${sha:0:12} from $upstream"
+    git init --quiet "$plugin_repo"
+    git -C "$plugin_repo" remote add origin "$upstream"
+  fi
+  git -C "$plugin_repo" cat-file -e "${sha}^{commit}" 2>/dev/null \
+    || git -C "$plugin_repo" fetch --quiet --depth 1 origin "$sha" \
+    || die "myvector: cannot fetch commit $sha from $upstream"
+  local resolved; resolved="$(git -C "$plugin_repo" rev-parse "${sha}^{commit}")"
+  [[ "$resolved" == "$sha" ]] \
+    || die "myvector: source.tag $sha resolved to $resolved -- not the pinned commit"
+
+  local server_repo="$VB_SOURCES/mysql-server-${server_tag}"
+  if [[ ! -d "$server_repo/.git" ]]; then
+    info "myvector: cloning server $server_tag from $server_up (shallow)"
+    git clone --quiet --depth 1 --branch "$server_tag" "$server_up" "$server_repo" \
+      || die "myvector: cannot clone $server_tag from $server_up"
+  fi
+  local server_pin; server_pin="$(yq_get "$cfg" source.server_commit "")"
+  [[ -n "$server_pin" ]] || die "myvector: $cfg has no source.server_commit"
+  local server_sha; server_sha="$(git -C "$server_repo" rev-parse "refs/tags/${server_tag}^{commit}" 2>/dev/null \
+                                  || git -C "$server_repo" rev-parse HEAD)"
+  # The same refusal the plugin commit gets: a tag that now names another
+  # commit is a different server tree under the pinned label.
+  [[ "$server_sha" == "$server_pin" ]] \
+    || die "myvector: server tag $server_tag resolved to $server_sha -- not the pinned $server_pin"
+
+  local tar="$VB_SOURCES/myvector-${sha}-${server_tag}.tar"
+  if [[ $FORCE -eq 0 && -f "$tar" ]]; then
+    ok "myvector: source tarball up to date ($(human_bytes "$(stat -c%s "$tar")"))"
+  else
+    info "myvector: exporting server $server_tag and plugin ${sha:0:12}"
+    git -C "$server_repo" archive --format=tar --prefix=source/ HEAD > "$tar.tmp"
+    git -C "$plugin_repo" archive --format=tar --prefix=myvector/ "$resolved" > "$tar.plugin"
+    tar --concatenate --file="$tar.tmp" "$tar.plugin"
+    rm -f "$tar.plugin"
+    mv "$tar.tmp" "$tar"
+  fi
+
+  python3 - "$VB_SOURCES/myvector.source.json" "$sha" "$resolved" "$release" \
+           "$upstream" "$server_tag" "$server_sha" "$server_up" <<'PY'
+import json, sys
+out, tag, commit, release, origin, server_tag, server_commit, server_origin = sys.argv[1:9]
+with open(out, "w") as fh:
+    json.dump({"engine": "myvector", "tag": tag, "commit": commit,
+               "release": release, "origin": origin,
+               "server_tag": server_tag, "server_commit": server_commit,
+               "server_origin": server_origin},
+              fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+  ok "myvector: plugin ${release} commit=${resolved:0:12}, server ${server_tag} commit=${server_sha:0:12}"
+  stage_context myvector "$tar"
+}
+
+# ---------------------------------------------------------------------------
+# VillageSQL -- TWO pinned sources in one context: the vsql_vector extension
+# at a commit, and the villagesql-server tree it is compiled against, at a tag.
+# ---------------------------------------------------------------------------
+#
+# MyVector's shape (prepare_myvector), and for the same reason: the extension
+# is built against the server's own build tree, so the context tarball carries
+# the server as `source/` and the extension beside it as `vsql-vector/`. The
+# extension is vsql-vector-pk, pinned by the commit SHA of its release tag
+# (config/engines/villagesql.yml says why -pk and not vsql-vector). Both are
+# shallow fetches into sources/ -- nothing here touches a vendor checkout. The
+# manifest's `engines.<engine>.source` is this function's JSON, so the server
+# tag and commit are recorded beside the extension commit.
+prepare_villagesql() {
+  # Takes the engine name, as prepare_mariadb does, so a second VillageSQL
+  # server line (`villagesql84`, `alias_of: villagesql`) reuses this routine
+  # with its own config. The server checkout is named after the server tag
+  # and the tarball after both commits, so two lines never collide; the
+  # vsql-vector object store is shared, which is safe because a commit SHA
+  # names exactly one tree.
+  local engine="${1:-villagesql}"
+  local cfg="$VB_CONFIG/engines/$engine.yml"
+  local sha; sha="$(yq_get "$cfg" source.tag "")"
+  [[ -n "$sha" ]] || die "$engine: $cfg has no source.tag"
+  local upstream; upstream="$(yq_get "$cfg" source.upstream https://github.com/villagesql/vsql-vector-pk.git)"
+  local server_tag; server_tag="$(yq_get "$cfg" source.server_tag "")"
+  [[ -n "$server_tag" ]] || die "$engine: $cfg has no source.server_tag"
+  local server_pin; server_pin="$(yq_get "$cfg" source.server_commit "")"
+  [[ -n "$server_pin" ]] || die "$engine: $cfg has no source.server_commit"
+  local server_up; server_up="$(yq_get "$cfg" source.server_upstream https://github.com/villagesql/villagesql-server.git)"
+
+  local ext_repo="$VB_SOURCES/vsql-vector-git"
+  if [[ ! -d "$ext_repo/.git" ]]; then
+    info "$engine: fetching vsql-vector commit ${sha:0:12} from $upstream"
+    git init --quiet "$ext_repo"
+    git -C "$ext_repo" remote add origin "$upstream"
+  fi
+  # The extension's repository is part of the pin (vsql-vector and
+  # vsql-vector-pk are both installed as `vsql_vector`), so a checkout made for
+  # an earlier pin follows `source.upstream` rather than fetching from the
+  # repository it was created for.
+  git -C "$ext_repo" remote set-url origin "$upstream"
+  git -C "$ext_repo" cat-file -e "${sha}^{commit}" 2>/dev/null \
+    || git -C "$ext_repo" fetch --quiet --depth 1 origin "$sha" \
+    || die "$engine: cannot fetch commit $sha from $upstream"
+  local resolved; resolved="$(git -C "$ext_repo" rev-parse "${sha}^{commit}")"
+  [[ "$resolved" == "$sha" ]] \
+    || die "$engine: source.tag $sha resolved to $resolved -- not the pinned commit"
+
+  # The tag contains a slash, so the checkout name flattens it.
+  local server_repo="$VB_SOURCES/villagesql-server-${server_tag//\//-}"
+  if [[ ! -d "$server_repo/.git" ]]; then
+    info "$engine: cloning server $server_tag from $server_up (shallow)"
+    git clone --quiet --depth 1 --branch "$server_tag" "$server_up" "$server_repo" \
+      || die "$engine: cannot clone $server_tag from $server_up"
+  fi
+  local server_sha; server_sha="$(git -C "$server_repo" rev-parse "refs/tags/${server_tag}^{commit}" 2>/dev/null \
+                                  || git -C "$server_repo" rev-parse HEAD)"
+  [[ "$server_sha" == "$server_pin" ]] \
+    || die "$engine: server tag $server_tag resolved to $server_sha -- not the pinned $server_pin"
+
+  local tar="$VB_SOURCES/villagesql-${sha}-${server_sha}.tar"
+  if [[ $FORCE -eq 0 && -f "$tar" ]]; then
+    ok "$engine: source tarball up to date ($(human_bytes "$(stat -c%s "$tar")"))"
+  else
+    info "$engine: exporting server $server_tag and vsql-vector ${sha:0:12}"
+    git -C "$server_repo" archive --format=tar --prefix=source/ "$server_sha" > "$tar.tmp"
+    git -C "$ext_repo" archive --format=tar --prefix=vsql-vector/ "$resolved" > "$tar.ext"
+    tar --concatenate --file="$tar.tmp" "$tar.ext"
+    rm -f "$tar.ext"
+    mv "$tar.tmp" "$tar"
+  fi
+
+  python3 - "$VB_SOURCES/${engine}.source.json" "$engine" "$sha" "$resolved" \
+           "$upstream" "$server_tag" "$server_sha" "$server_up" <<'PY'
+import json, sys
+out, engine, tag, commit, origin, server_tag, server_commit, server_origin = sys.argv[1:9]
+with open(out, "w") as fh:
+    json.dump({"engine": engine, "tag": tag, "commit": commit,
+               "origin": origin, "server_tag": server_tag,
+               "server_commit": server_commit, "server_origin": server_origin},
+              fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+  ok "$engine: vsql-vector commit=${resolved:0:12}, server ${server_tag} commit=${server_sha:0:12}"
+  stage_context "$engine" "$tar"
+}
+
 case "$ENGINE" in
   all)        prepare_mariadb mariadb; prepare_alisql; prepare_pgvector ;;
+  percona)    prepare_percona ;;
+  myvector)   prepare_myvector ;;
+  # villagesql84 is the same routine on its own config (`alias_of: villagesql`).
+  villagesql|villagesql84) prepare_villagesql "$ENGINE" ;;
   mariadb)    prepare_mariadb mariadb ;;
   mariadb123) prepare_mariadb mariadb123 ;;
   alisql)     prepare_alisql ;;
   pgvector)   prepare_pgvector ;;
   mongodb)    prepare_mongodb ;;
   valkey)     prepare_valkey ;;
-  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|valkey|all)" ;;
+  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|valkey|percona|myvector|villagesql|villagesql84|all)" ;;
 esac
 
 ok "sources prepared"
