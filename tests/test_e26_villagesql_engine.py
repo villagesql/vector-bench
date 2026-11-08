@@ -279,13 +279,20 @@ class TestBruteForceIsRefused:
                        for s in d._cur.statements)
         assert d._cur.statements[-1].startswith("EXPLAIN FORMAT=TREE ")
 
-    def test_a_plan_on_the_index_is_measured_with_the_vector_inlined(self):
+    def test_a_plan_on_the_index_is_measured_with_the_vector_bound(self):
         d = driver(plan=INDEX_PLAN)
         assert d.query(numpy.ones(4), 10) == list(range(10))
         sql = d._cur.statements[-1]
-        assert sql == ("SELECT id FROM t1 ORDER BY "
-                       "L2_DISTANCE(v, '[1.0,1.0,1.0,1.0]') LIMIT 10")
-        assert d._cur.params[-1] is None
+        assert sql == "SELECT id FROM t1 ORDER BY L2_DISTANCE(v, %s) LIMIT 10"
+        assert d._cur.params[-1] == ("[1.0,1.0,1.0,1.0]",)
+
+    def test_the_plan_check_explains_the_bound_statement(self):
+        d = driver(plan=INDEX_PLAN)
+        d.query(numpy.ones(4), 10)
+        explain = d._cur.statements.index(
+            "EXPLAIN FORMAT=TREE SELECT id FROM t1 ORDER BY "
+            "L2_DISTANCE(v, %s) LIMIT 10")
+        assert d._cur.params[explain] == ("[1.0,1.0,1.0,1.0]",)
 
     def test_the_marker_must_name_this_index(self):
         d = driver(plan=INDEX_PLAN.replace("on vi", "on other_index"))
@@ -300,14 +307,14 @@ class TestBruteForceIsRefused:
     def test_cosine_orders_by_the_function_its_profile_binds(self):
         d = driver(metric="angular", plan=INDEX_PLAN)
         d.query(numpy.ones(4), 5)
-        assert "ORDER BY COSINE_DISTANCE(v, '[" in d._cur.statements[-1]
+        assert "ORDER BY COSINE_DISTANCE(v, %s)" in d._cur.statements[-1]
 
     def test_filtered_binds_the_threshold_and_whitelists_the_column(self):
         d = driver(plan=INDEX_PLAN)
         d.query_filtered(numpy.ones(4), 10, 7, column="ctag")
         assert d._cur.statements[-1].startswith(
             "SELECT id FROM t1 WHERE ctag < %s ORDER BY")
-        assert d._cur.params[-1] == (7,)
+        assert d._cur.params[-1] == (7, "[1.0,1.0,1.0,1.0]")
         with pytest.raises(ValueError):
             d.query_filtered(numpy.ones(4), 10, 7, column="tag; DROP")
 
@@ -442,8 +449,8 @@ class TestAnnModule:
         assert algo._plan_verified is True
         assert algo.query(numpy.ones(4), 10) == list(range(10))
         assert algo._cur.statements[-1] == (
-            "SELECT id FROM t1 ORDER BY L2_DISTANCE(v, '[1.0,1.0,1.0,1.0]') "
-            "LIMIT 10")
+            "SELECT id FROM t1 ORDER BY L2_DISTANCE(v, %s) LIMIT 10")
+        assert algo._cur.params[-1] == ("[1.0,1.0,1.0,1.0]",)
 
     def test_the_records_carry_the_ef_construction_built(
             self, annmod, monkeypatch):

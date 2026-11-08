@@ -18,8 +18,9 @@ extension:
   (`capabilities.bulk_vector_index_build` in config/engines/villagesql.yml
   has the evidence).
 * Vectors are text (`'[a,b,...]'`, shortest float32 repr per element). The
-  query vector is inlined, because the server's KNN recognition needs a
-  constant query operand.
+  query vector is bound, as text; the server re-prepares on each execute to
+  see it as the constant its KNN recognition needs, and the plan check
+  EXPLAINs the same bound statement.
 * `vsql_vector.ef_search` is a per-session variable, set on every connection
   that queries.
 * **The plan is checked and a full scan is REFUSED, not measured.** The
@@ -181,10 +182,10 @@ class VillageSQL(VBMySQLBase):
     # Query
     # ------------------------------------------------------------------
 
-    def _ann_sql(self, v, k: int) -> str:
+    def _ann_sql(self, k: int) -> str:
         _profile, function = PROFILES[self._metric]
         return (f"SELECT id FROM {TABLE} "
-                f"ORDER BY {function}(v, '{text_literal(v)}') LIMIT {int(k)}")
+                f"ORDER BY {function}(v, %s) LIMIT {int(k)}")
 
     def set_query_arguments(self, ef_search: int) -> None:
         self._ef_search = int(ef_search)
@@ -210,7 +211,8 @@ class VillageSQL(VBMySQLBase):
         rng = numpy.random.RandomState(0)
         for _ in range(WARMUP_QUERIES):
             try:
-                self._cur.execute(self._ann_sql(rng.normal(size=self._dim), 10))
+                self._cur.execute(self._ann_sql(10),
+                                  (text_literal(rng.normal(size=self._dim)),))
                 self._cur.fetchall()
             except Exception:
                 return
@@ -218,7 +220,8 @@ class VillageSQL(VBMySQLBase):
     def _verify_plan(self, k: int = 10) -> bool:
         probe = numpy.ones(max(self._dim, 1), dtype="<f4")
         try:
-            self._cur.execute("EXPLAIN FORMAT=TREE " + self._ann_sql(probe, k))
+            self._cur.execute("EXPLAIN FORMAT=TREE " + self._ann_sql(k),
+                              (text_literal(probe),))
             rows = self._cur.fetchall()
         except Exception as exc:
             print(f"[vb] WARNING: could not EXPLAIN the query plan: {exc}",
@@ -231,7 +234,7 @@ class VillageSQL(VBMySQLBase):
         return used
 
     def query(self, v, n: int) -> List[int]:
-        self._cur.execute(self._ann_sql(v, n))
+        self._cur.execute(self._ann_sql(n), (text_literal(v),))
         return [row[0] for row in self._cur.fetchall()]
 
     def batch_query(self, X, n: int) -> None:
@@ -244,7 +247,7 @@ class VillageSQL(VBMySQLBase):
             cur.execute(self.dialect.set_ef_search.format(ef_search=self._ef_search))
             out = []
             for v in chunk:
-                cur.execute(self._ann_sql(v, n))
+                cur.execute(self._ann_sql(n), (text_literal(v),))
                 out.append([row[0] for row in cur.fetchall()])
             cur.close()
             conn.close()

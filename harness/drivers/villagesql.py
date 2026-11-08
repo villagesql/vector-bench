@@ -23,11 +23,14 @@ the server or the extension at the pin in `config/engines/villagesql.yml`
    shortest float32 repr per element, which `strtof` reads back to the same
    bits, so no value changes -- but formatting and parsing it is a cost only
    this engine pays, on the load and inside every timed query, and the record
-   says so (`extra.vector_binding`). The query vector is INLINED as a literal
-   rather than bound: the server's KNN recognition requires the query operand
-   to be a constant item (`BindFieldAndQuery` in villagesql/sql/
-   custom_index_knn_recognition.cc), which a prepared-statement parameter is
-   not at optimisation time.
+   says so (`extra.vector_binding`). The query vector is BOUND, as text, like
+   every other MySQL-family engine's packed float32. The server's KNN
+   recognition requires a constant query operand (`BindFieldAndQuery` in
+   villagesql/sql/custom_index_knn_recognition.cc), which a parameter is not
+   at prepare time; the server re-prepares the statement on each execute with
+   the value substituted, so the bound query is recognised and pays that
+   re-prepare server side. The plan check below EXPLAINs the same bound
+   statement, so a server that does not recognise it is refused, not timed.
 
 3. **The plan is checked, and a query that does not use the index is
    refused.** The server drives a distance scan only from an index whose
@@ -135,10 +138,8 @@ def text_literal(vector) -> str:
 
     `str(numpy.float32(x))` is the shortest decimal that round-trips to the
     same float32, and the server parses each element with `strtof`, so the
-    stored vector is bit-identical to the dataset's. Only digits, signs,
-    `.`, `e`, `,` and brackets can appear, which is what makes inlining it
-    into a statement safe; a non-finite value would not round-trip and is
-    refused here rather than sent.
+    stored vector is bit-identical to the dataset's. A non-finite value
+    would not round-trip and is refused here rather than sent.
     """
     arr = numpy.asarray(vector, dtype="<f4")
     if not numpy.all(numpy.isfinite(arr)):
@@ -355,12 +356,11 @@ class VillageSQLDriver(MySQLFamilyDriver):
     # ------------------------------------------------------------------
 
     def _select(self, k: int, filtered: bool, *,
-                column: str = FILTER_TAG, vector=None) -> str:
-        """The one SELECT, with the query vector inlined (module docstring 2).
+                column: str = FILTER_TAG) -> str:
+        """The one SELECT; the threshold and the text vector are bound
+        (module docstring 2).
 
-        `filtered` keeps the base class's flag guard; the threshold is still
-        a bound parameter, and only the vector literal -- which `text_literal`
-        restricts to number characters -- is formatted in.
+        `filtered` keeps the base class's flag guard.
         """
         if not isinstance(filtered, bool):
             raise TypeError(
@@ -370,17 +370,16 @@ class VillageSQLDriver(MySQLFamilyDriver):
         where = (f"WHERE {checked_filter_column(column)} < %s "
                  if filtered else "")
         _profile, function = self._profile(self._index)
-        literal = "'" + text_literal(vector) + "'"
         return (f"SELECT id FROM {TABLE} {where}"
-                f"ORDER BY {function}(v, {literal}) LIMIT {int(k)}")
+                f"ORDER BY {function}(v, %s) LIMIT {int(k)}")
 
     def _plan(self, vector, k: int, tag_threshold: Optional[int],
               column: str) -> str:
         filtered = tag_threshold is not None
         self._cur.execute(
-            "EXPLAIN FORMAT=TREE "
-            + self._select(k, filtered, column=column, vector=vector),
-            (int(tag_threshold),) if filtered else None)
+            "EXPLAIN FORMAT=TREE " + self._select(k, filtered, column=column),
+            ((int(tag_threshold), text_literal(vector)) if filtered
+             else (text_literal(vector),)))
         return " | ".join(str(c) for row in self._cur.fetchall() for c in row)
 
     def explain_uses_vector_index(self, vector, k: int,
@@ -432,15 +431,15 @@ class VillageSQLDriver(MySQLFamilyDriver):
 
     def query(self, vector, k: int) -> List[int]:
         self._require_index(vector, k)
-        self._cur.execute(self._select(k, False, vector=vector))
+        self._cur.execute(self._select(k, False), (text_literal(vector),))
         return [row[0] for row in self._cur.fetchall()]
 
     def query_filtered(self, vector, k: int, threshold: int,
                        column: str = FILTER_TAG) -> List[int]:
         # Declined (`declined_workloads`); kept correct for a lab script.
         self._require_index(vector, k, threshold, column)
-        self._cur.execute(self._select(k, True, column=column, vector=vector),
-                          (int(threshold),))
+        self._cur.execute(self._select(k, True, column=column),
+                          (int(threshold), text_literal(vector)))
         return [row[0] for row in self._cur.fetchall()]
 
     # ------------------------------------------------------------------

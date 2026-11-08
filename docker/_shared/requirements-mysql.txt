@@ -15,5 +15,26 @@
 # Building from source makes the extension compile against whatever
 # libmariadb-dev the image actually has, so the image works on any base whose
 # Connector/C version happens to differ from the wheel's.
---no-binary mariadb
-mariadb==1.1.10
+#
+# 2.0 and not 1.1.x, because 1.1.x cannot reuse a prepared statement against a
+# MySQL server. Every execute() of a non-prepared cursor resets its statement
+# (cursors.py `_reset`, mariadb_cursor.c `ma_cursor_reset`), and a prepared=True
+# cursor still re-prepares because `_reprepare` is only cleared on the parse
+# path; Connector/C then sends COM_STMT_CLOSE + COM_STMT_PREPARE, waits, and
+# sends COM_STMT_EXECUTE. Only a server that advertises itself as MariaDB gets
+# the one-round-trip execute_direct form (statement id -1), so a bound query
+# cost MariaDB one round trip and AliSQL and Percona two, with a server-side
+# prepare on every query for all three. 2.0 caches the
+# statement on the cursor: one COM_STMT_PREPARE, then one COM_STMT_EXECUTE per
+# query on every server (checked on the wire against MySQL 9.7 and MariaDB 11.8).
+#
+# The `c` extra is the Connector/C implementation, the same client code path
+# 1.1.x used. 2.0 also ships a pure-Python protocol implementation, which is
+# what `mariadb` alone installs and would put a slower client under every
+# MySQL-family number; the drivers set MARIADB_PYTHON_CONNECTOR=c so the import
+# fails instead of falling back to it. Not the `binary` extra: its wheel bundles
+# a Connector/C whose plugin directory is a build-machine path, so
+# caching_sha2_password cannot load. mariadb-c is sdist-only, built against the
+# image's libmariadb-dev (Connector/C >= 3.3.1) exactly as above.
+--no-binary mariadb-c
+mariadb[c]==2.0.0rc2

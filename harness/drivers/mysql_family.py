@@ -40,6 +40,10 @@ from .base import (DATABASE, FILTER_CTAG, FILTER_TAG, TABLE, ConnectionSpec,
 
 PROGRESS_INTERVAL_S = float(os.environ.get("VB_PROGRESS_INTERVAL", "20"))
 
+# The Connector/C implementation of Connector/Python 2.0, never its pure-Python
+# fallback: set before the import so a missing C extension fails the import
+# instead of silently changing the client (docker/_shared/requirements-mysql.txt).
+os.environ.setdefault("MARIADB_PYTHON_CONNECTOR", "c")
 try:
     import mariadb as _connector
 except ImportError:  # pragma: no cover - only the bench image has it
@@ -315,6 +319,10 @@ class MySQLFamilyDriver(EngineDriver):
             password=self.spec.password,
             autocommit=True,
             connect_timeout=30,
+            # Every parameterized execute uses the binary protocol and the
+            # cursor keeps its prepared statement across executes of the same
+            # SQL: one COM_STMT_EXECUTE per query after the first.
+            binary=True,
         )
         self._cur = self._conn.cursor()
         for stmt in self.dialect.global_setup:
@@ -472,7 +480,7 @@ class MySQLFamilyDriver(EngineDriver):
                 conn = _connector.connect(
                     host=self.spec.host, port=self.spec.port,
                     user=self.spec.user, password=self.spec.password,
-                    autocommit=True, connect_timeout=30,
+                    autocommit=True, connect_timeout=30, binary=True,
                 )
                 try:
                     cur = conn.cursor()

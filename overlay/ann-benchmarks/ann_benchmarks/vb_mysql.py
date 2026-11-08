@@ -30,6 +30,10 @@ import numpy
 from .algorithms.base.module import BaseANN
 from .vb_warmup import IndexWarmupMixin
 
+# The Connector/C implementation of Connector/Python 2.0, never its pure-Python
+# fallback: set before the import so a missing C extension fails the import
+# instead of silently changing the client (docker/_shared/requirements-mysql.txt).
+os.environ.setdefault("MARIADB_PYTHON_CONNECTOR", "c")
 try:  # pragma: no cover - exercised only inside the bench images
     import mariadb as _connector
 except ImportError:  # pragma: no cover
@@ -237,12 +241,17 @@ class VBMySQLBase(IndexWarmupMixin, BaseANN):
         The server runs with grants enabled (see the entrypoint: --skip-grant-tables
         would implicitly disable networking on MySQL 8), so a real account is used
         even over the unix socket. Identical for both MySQL-family engines.
+
+        `binary`: every parameterized execute uses the binary protocol and the
+        cursor keeps its prepared statement across executes of the same SQL,
+        so a timed query is one COM_STMT_EXECUTE.
         """
         return {
             "unix_socket": self._socket,
             "user": os.environ.get("VB_DB_USER", "bench"),
             "password": os.environ.get("VB_DB_PASSWORD", "bench"),
             "autocommit": True,
+            "binary": True,
         }
 
     def _connect(self):

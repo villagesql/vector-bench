@@ -232,7 +232,7 @@ RUN MARIADB_CONFIG=/usr/bin/mariadb_config \
     pip3 install --no-cache-dir --break-system-packages \
         -r /tmp/requirements-bench.txt -r /tmp/requirements-mysql.txt \
     && rm -f /tmp/requirements-bench.txt /tmp/requirements-mysql.txt \
-    && python3 -c "import mariadb; print('Connector/Python', mariadb.__version__, 'OK')"
+    && MARIADB_PYTHON_CONNECTOR=c python3 -c "import mariadb; print('Connector/Python', mariadb.__version__, 'OK')"
 
 
 WORKDIR /home/app

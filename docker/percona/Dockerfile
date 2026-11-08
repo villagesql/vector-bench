@@ -871,7 +871,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # reason: MariaDB Connector/C speaks the MySQL protocol, so all three
 # MySQL-family engines are driven through an identical client with
 # binary-protocol prepared statements, and differences in the numbers belong to
-# the servers. requirements-mysql.txt pins mariadb==1.1.10 with --no-binary.
+# the servers. requirements-mysql.txt pins mariadb[c]==2.0.0rc2, built from
+# source (--no-binary mariadb-c).
 #
 # MARIADB_CONFIG points at the distro's mariadb_config and not at the one on
 # PATH, exactly as in the MariaDB and AliSQL images. Here PATH starts with
@@ -892,7 +893,7 @@ RUN MARIADB_CONFIG=/usr/bin/mariadb_config \
     pip3 install --no-cache-dir --break-system-packages \
         -r /tmp/requirements-bench.txt -r /tmp/requirements-mysql.txt \
     && rm -f /tmp/requirements-bench.txt /tmp/requirements-mysql.txt \
-    && python3 -c "import mariadb; print('Connector/Python', mariadb.__version__, 'OK')"
+    && MARIADB_PYTHON_CONNECTOR=c python3 -c "import mariadb; print('Connector/Python', mariadb.__version__, 'OK')"
 
 WORKDIR /home/app
 ENV PERCONA_ROOT_DIR=/opt/percona \
